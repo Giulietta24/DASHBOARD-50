@@ -201,17 +201,34 @@ SMALL_CAP_UNIVERSE = {
 
 # Macro tickers
 MACRO_TICKERS = {
+    # ── Core market fear / credit ──────────────────────────
     "VIX":             "^VIX",
-    "Gold":            "GC=F",
-    "Crude Oil":       "CL=F",
-    "US Dollar (DXY)": "DX-Y.NYB",
-    "10Y Treasury":    "^TNX",
-    "2Y Treasury":     "^IRX",
     "HYG":             "HYG",
     "TLT":             "TLT",
+    # ── Equity benchmarks ─────────────────────────────────
     "SPY":             "^GSPC",
     "RSP":             "RSP",
     "IWM":             "IWM",
+    # ── Rates ─────────────────────────────────────────────
+    "10Y Treasury":    "^TNX",
+    "2Y Treasury":     "^IRX",
+    "US Dollar (DXY)": "DX-Y.NYB",
+    # ── Core commodities ──────────────────────────────────
+    "Gold":            "GC=F",
+    "Silver":          "SI=F",
+    "Crude Oil":       "CL=F",
+    "Copper":          "HG=F",
+    "Natural Gas":     "NG=F",
+    "Wheat":           "ZW=F",
+    # ── Currencies (all vs USD) ───────────────────────────
+    "GBP/USD":         "GBPUSD=X",   # YOUR capital currency — P&L risk
+    "EUR/USD":         "EURUSD=X",   # European growth / dollar strength
+    "USD/JPY":         "USDJPY=X",   # Risk appetite — falling = risk-off
+    "AUD/USD":         "AUDUSD=X",   # China/commodity proxy
+    "USD/CAD":         "USDCAD=X",   # Oil proxy
+    # ── Real Estate / REITs ───────────────────────────────
+    "REITs (VNQ)":     "VNQ",        # Rate sensitivity signal
+    "Data Centre REITs":"EQIX",      # Tech proxy disguised as real estate
 }
 
 # GBP/USD rate for sizing (approximation)
@@ -1261,6 +1278,245 @@ def calc_relative_strength(stock_tickers, etf_ticker, period="1mo"):
 
 
 
+@st.cache_data(ttl=300)
+def fetch_cross_asset(macro_snapshot):
+    """
+    Extracts cross-asset signals from the macro snapshot and
+    computes derived ratios: Silver/Gold, Copper/Gold, REITs vs Bonds.
+    """
+    def chg(key):   return macro_snapshot.get(key, {}).get("chg_1d")
+    def price(key): return macro_snapshot.get(key, {}).get("price")
+
+    sg_ratio = round(price("Silver") / price("Gold"), 4) if price("Silver") and price("Gold") else None
+    cg_ratio = round(price("Copper") / price("Gold"), 6) if price("Copper") and price("Gold") else None
+
+    vnq_chg = chg("REITs (VNQ)")
+    tlt_chg = chg("TLT")
+    reit_bond_signal = None
+    if vnq_chg is not None and tlt_chg is not None:
+        if vnq_chg > 0.5 and tlt_chg > 0.5:
+            reit_bond_signal = ("🟢 Both rising", "REITs and bonds up — rates falling. Buy calls on VNQ, XLU.")
+        elif vnq_chg < -0.5 and tlt_chg < -0.5:
+            reit_bond_signal = ("🔴 Both falling", "Rates rising aggressively. Avoid real estate and utilities.")
+        elif vnq_chg > 0.5 and tlt_chg < -0.5:
+            reit_bond_signal = ("🟡 Diverging", "REITs rising, bonds still falling — market pricing rate cuts.")
+        else:
+            reit_bond_signal = ("🟡 Mixed", "No strong REIT/Bond signal today.")
+
+    return {
+        "sg_ratio":    sg_ratio,
+        "cg_ratio":    cg_ratio,
+        "reit_bond":   reit_bond_signal,
+        "gbpusd_live": price("GBP/USD"),
+        "silver_chg":  chg("Silver"),
+        "copper_chg":  chg("Copper"),
+        "natgas_chg":  chg("Natural Gas"),
+        "wheat_chg":   chg("Wheat"),
+        "gbpusd_chg":  chg("GBP/USD"),
+        "eurusd_chg":  chg("EUR/USD"),
+        "usdjpy_chg":  chg("USD/JPY"),
+        "audusd_chg":  chg("AUD/USD"),
+        "usdcad_chg":  chg("USD/CAD"),
+        "vnq_chg":     vnq_chg,
+        "eqix_chg":    chg("Data Centre REITs"),
+    }
+
+
+def analyse_scenarios(macro, cross):
+    """
+    Identifies which cross-asset scenarios are active and what
+    trades they suggest. Returns list sorted by confidence.
+    """
+    scenarios = []
+
+    def chg(key):   return macro.get(key, {}).get("chg_1d") or 0
+    def price(key): return macro.get(key, {}).get("price") or 0
+
+    vix      = price("VIX")
+    gold_c   = chg("Gold")
+    oil_c    = chg("Crude Oil")
+    dxy_c    = chg("US Dollar (DXY)")
+    spy_c    = chg("SPY")
+    hyg_c    = chg("HYG")
+    tlt_c    = chg("TLT")
+    copper_c = cross.get("copper_chg") or 0
+    silver_c = cross.get("silver_chg") or 0
+    audusd_c = cross.get("audusd_chg") or 0
+    usdjpy_c = cross.get("usdjpy_chg") or 0
+    gbpusd_c = cross.get("gbpusd_chg") or 0
+    eurusd_c = cross.get("eurusd_chg") or 0
+    vnq_c    = cross.get("vnq_chg") or 0
+    usdcad_c = cross.get("usdcad_chg") or 0
+    natgas_c = cross.get("natgas_chg") or 0
+    wheat_c  = cross.get("wheat_chg") or 0
+
+    # ── SCENARIO 1: Global Growth Accelerating ────────────────
+    s1 = []
+    if copper_c >= 1.0:             s1.append(f"Copper +{copper_c:.1f}% — industrial demand rising")
+    if audusd_c >= 0.5:             s1.append(f"AUD/USD +{audusd_c:.1f}% — China/commodity demand")
+    if silver_c > gold_c + 0.5:     s1.append(f"Silver outperforming gold — industrial > fear")
+    if spy_c >= 0.5 and hyg_c >= 0: s1.append(f"Equities up + credit healthy — broad participation")
+    if s1:
+        scenarios.append({
+            "name": "🌱 Global Growth Accelerating",
+            "confidence": len(s1), "signals": s1,
+            "what": (
+                "Copper and AUD/USD are the world's best economic growth barometers — "
+                "they move 4-6 weeks before GDP data confirms it. "
+                "Silver outperforming gold confirms demand is industrial not fear-driven. "
+                "This is an early signal to rotate into cyclicals before the crowd notices."
+            ),
+            "buy_calls":  ["XLB (materials)", "XLI (industrials)", "GDX (gold miners)",
+                           "EEM (emerging markets)", "KWEB (China)", "CAT", "RIO", "MP Materials"],
+            "buy_puts":   ["TLT (bonds sell off as growth picks up)", "XLU (utilities rotate out)"],
+            "income":     ["Sell puts below 50MA on XLB, XLI — premium elevated, trend supports"],
+            "avoid":      ["Defensive sectors XLP, XLU, XLV", "Long bonds TLT"],
+            "gbp_note":   f"GBP/USD {gbpusd_c:+.2f}% — " + (
+                "strengthening GBP means US profits buy more pounds. Good environment for your capital."
+                if gbpusd_c >= 0 else
+                "weakening GBP reduces UK value of US profits. Consider sizing down slightly."
+            ),
+        })
+
+    # ── SCENARIO 2: Risk-Off / Yen Carry Unwind ───────────────
+    s2 = []
+    if usdjpy_c <= -0.8: s2.append(f"USD/JPY -{abs(usdjpy_c):.1f}% — yen strengthening, carry unwind")
+    if gold_c >= 1.0:    s2.append(f"Gold +{gold_c:.1f}% — safe-haven flight")
+    if hyg_c <= -0.5:    s2.append(f"HYG -{abs(hyg_c):.1f}% — credit stress")
+    if spy_c <= -1.0:    s2.append(f"SPY -{abs(spy_c):.1f}% — equities selling off")
+    if vix >= 20 and chg("VIX") >= 5: s2.append(f"VIX spiking +{chg('VIX'):.1f}%")
+    if s2:
+        scenarios.append({
+            "name": "🌀 Risk-Off / Yen Carry Unwind",
+            "confidence": len(s2), "signals": s2,
+            "what": (
+                "The yen carry trade: borrow cheap yen, buy higher-yielding assets. "
+                "When the yen strengthens (USD/JPY falls), traders must unwind — "
+                "selling assets globally to repay yen loans. "
+                "This creates sudden sharp sell-offs in equities, crypto, and EM. "
+                "HYG falling confirms it's credit stress not just equity weakness."
+            ),
+            "buy_calls":  ["GLD (gold)", "TLT (flight to safety)", "XLP (defensive staples)", "XLV (defensive health)"],
+            "buy_puts":   ["QQQ", "SMH", "EEM", "KWEB", "XLY — all hit hardest in carry unwind"],
+            "income":     ["Sell call spreads above resistance on QQQ — elevated IV, capped upside"],
+            "avoid":      ["Buying calls on any growth/cyclical", "Naked puts — gaps possible"],
+            "gbp_note":   "GBP typically weakens vs USD in risk-off. Your put profits in USD buy more GBP if GBP falls — natural partial hedge.",
+        })
+
+    # ── SCENARIO 3: Stagflation ───────────────────────────────
+    s3 = []
+    if oil_c >= 2.0:   s3.append(f"Oil +{oil_c:.1f}% — energy inflation")
+    if dxy_c >= 0.5:   s3.append(f"Dollar +{dxy_c:.1f}% — tightening conditions")
+    if gold_c >= 0.8:  s3.append(f"Gold +{gold_c:.1f}% — inflation hedge demand")
+    if wheat_c >= 2.0: s3.append(f"Wheat +{wheat_c:.1f}% — food price inflation")
+    if natgas_c >= 3:  s3.append(f"Nat gas +{natgas_c:.1f}% — energy cost surge")
+    if spy_c <= 0:     s3.append("Equities flat/falling despite energy surge")
+    if len(s3) >= 3:
+        scenarios.append({
+            "name": "🔥 Stagflation — Inflation Without Growth",
+            "confidence": len(s3), "signals": s3,
+            "what": (
+                "Rising prices (oil, gas, food) with stagnant or falling growth. "
+                "The worst environment for most portfolios. "
+                "Growth stocks suffer — rates must stay high to fight inflation. "
+                "Consumer discretionary suffers — less disposable income. "
+                "Energy and commodity producers are the only winners — "
+                "they're selling the thing that's expensive."
+            ),
+            "buy_calls":  ["XLE (energy)", "XOP (oil exploration)", "OIH (oil services)", "GLD", "XLB"],
+            "buy_puts":   ["QQQ (growth crushed)", "XLY (consumer squeezed)", "ITB (homebuilders)"],
+            "income":     ["Sell puts on XLE below support — collect energy premium",
+                           "Sell call spreads on QQQ — capped upside in stagflation"],
+            "avoid":      ["ARKK, high-multiple tech", "REITs (rate headwind)", "XLY"],
+            "gbp_note":   (
+                "Oil priced in USD. Rising oil + strong dollar = double cost pressure for UK. "
+                f"GBP/USD {gbpusd_c:+.2f}% — UK capital buys fewer USD today."
+            ),
+        })
+
+    # ── SCENARIO 4: Dollar Surge ──────────────────────────────
+    s4 = []
+    if dxy_c >= 0.8:   s4.append(f"DXY +{dxy_c:.1f}% — dollar surging")
+    if audusd_c <= -0.5: s4.append(f"AUD/USD -{abs(audusd_c):.1f}% — commodity currencies falling")
+    if eurusd_c <= -0.5: s4.append(f"EUR/USD -{abs(eurusd_c):.1f}% — European weakness")
+    if copper_c <= -0.5: s4.append(f"Copper -{abs(copper_c):.1f}% — global demand concerns")
+    if usdcad_c >= 0.5:  s4.append(f"USD/CAD +{usdcad_c:.1f}% — oil/CAD under pressure")
+    if len(s4) >= 2:
+        scenarios.append({
+            "name": "💵 Dollar Surge",
+            "confidence": len(s4), "signals": s4,
+            "what": (
+                "Rising dollar = headwind for almost everything priced in USD. "
+                "Commodities more expensive for foreign buyers (demand falls). "
+                "US multinationals see overseas earnings worth less when converted. "
+                "EM countries with USD debt face financing crises. "
+                "Dollar surges when US rates are high vs other countries, or in risk-off."
+            ),
+            "buy_calls":  ["Domestic US companies (XLP, XLV)", "UUP (direct dollar exposure)"],
+            "buy_puts":   ["GLD", "GDX", "EEM", "KWEB", "XLE if oil falls"],
+            "income":     ["Sell puts on domestic US large caps — stable during dollar surge"],
+            "avoid":      ["GDX, SIL, XOP", "EEM, KWEB, FXI", "AAPL/MSFT — high FX exposure"],
+            "gbp_note":   (
+                f"GBP/USD {gbpusd_c:+.2f}% — dollar surge means your £35K buys fewer USD contracts. "
+                "Effective sizing constraint — reduce notional exposure or wait for stabilisation."
+            ),
+        })
+
+    # ── SCENARIO 5: Rate Cut Expectation ─────────────────────
+    s5 = []
+    if tlt_c >= 0.8:    s5.append(f"TLT +{tlt_c:.1f}% — bonds rallying, rates falling")
+    if vnq_c >= 0.8:    s5.append(f"REITs +{vnq_c:.1f}% — rate-sensitive sectors recovering")
+    if usdjpy_c <= -0.5: s5.append(f"USD/JPY -{abs(usdjpy_c):.1f}% — rate differential narrowing")
+    if dxy_c <= -0.3:   s5.append(f"Dollar -{abs(dxy_c):.1f}% — weaker USD on rate cut bets")
+    if chg("2Y Treasury") <= -0.05: s5.append("2Y yields falling — Fed cut priced in")
+    if len(s5) >= 2:
+        scenarios.append({
+            "name": "📉 Rate Cut Expectation Building",
+            "confidence": len(s5), "signals": s5,
+            "what": (
+                "Bond markets pricing in future rate cuts. "
+                "Lower rates are good for: growth stocks (future earnings worth more), "
+                "REITs (cheaper financing, better yield spread), "
+                "small caps (floating-rate debt relief), EM (USD weakens). "
+                "One of the strongest tailwinds for growth plays."
+            ),
+            "buy_calls":  ["QQQ", "XLK", "VNQ (REITs re-rate)", "XLU", "IWM (small cap relief)", "ARKK"],
+            "buy_puts":   ["UUP (dollar weakens)", "GLD may dip if risk-on rotation"],
+            "income":     ["Sell puts on QQQ, XLK below support — rising tide gives buffer"],
+            "avoid":      ["Short bonds (TLT puts) — fighting the trend"],
+            "gbp_note":   (
+                f"Rate cuts weaken USD vs GBP. GBP/USD {gbpusd_c:+.2f}% today. "
+                "Stronger pound means US profits buy more in UK — but US contracts cost more in GBP."
+            ),
+        })
+
+    # ── SCENARIO 6: GBP Alert ────────────────────────────────
+    if abs(gbpusd_c) >= 0.8:
+        direction = "rising" if gbpusd_c > 0 else "falling"
+        scenarios.append({
+            "name": f"💷 GBP/USD Alert — {direction.title()}",
+            "confidence": 2 if abs(gbpusd_c) >= 1.5 else 1,
+            "signals": [f"GBP/USD {gbpusd_c:+.2f}% — significant move affecting your P&L"],
+            "what": (
+                f"GBP is {direction} significantly vs USD today. "
+                + ("Stronger GBP: US profits buy more pounds on repatriation. "
+                   "Consider sizing up slightly — your effective buying power is higher."
+                   if gbpusd_c > 0 else
+                   "Weaker GBP: US profits buy fewer pounds on repatriation. "
+                   "Your £35K buys fewer USD options contracts today. Size down or wait.")
+            ),
+            "buy_calls":  (["UK ADRs: AZN, GSK, BP, SHEL — strong GBP helps UK earnings"] if gbpusd_c > 0 else
+                           ["USD-denominated assets — profits worth more in GBP when converted"]),
+            "buy_puts":   [],
+            "income":     ["GBP vol = income opportunity — elevated currency vol can be harvested"],
+            "avoid":      (["Oversizing when GBP weak — capital constraint"] if gbpusd_c < 0 else []),
+            "gbp_note":   f"Live rate: {cross.get('gbpusd_live', GBPUSD):.4f} GBP/USD",
+        })
+
+    scenarios.sort(key=lambda x: x["confidence"], reverse=True)
+    return scenarios
+
+
 @st.cache_data(ttl=300)   # 5-min cache — VWAP is intraday, needs to be fresh
 def fetch_vwap(tickers):
     """
@@ -1323,6 +1579,320 @@ def fetch_vwap(tickers):
         except Exception:
             pass
     return result
+
+
+@st.cache_data(ttl=1800)   # 30-min cache — breadth is a daily signal, not intraday
+def fetch_breadth():
+    """
+    Fetches S&P 500 breadth: % of stocks above 20-day and 50-day MAs.
+
+    Three-tier approach — stops at first success:
+
+    Tier 1 — yfinance tickers ^S5TW / ^S5FI
+      Zero maintenance. If Yahoo Finance serves these, perfect.
+      ^S5TW = % S&P 500 stocks above 20-day MA (TW = Twenty)
+      ^S5FI = % S&P 500 stocks above 50-day MA (FI = FIfty)
+
+    Tier 2 — Barchart text scraping
+      Uses regex on raw HTML text, NOT CSS class names.
+      CSS classes change frequently (Barchart redesigns = dashboard breaks).
+      Text identifiers like "Percent of Stocks Above 20" are stable —
+      they are the content, not the styling. Much more resilient.
+
+    Tier 3 — Own universe proxy
+      Calculates from stocks in STOCK_UNIVERSE + SMALL_CAP_UNIVERSE.
+      Not true S&P 500 breadth but directionally reliable.
+      Loads in ~20 seconds.
+
+    Returns dict with:
+      pct_above_20:   float (0-100) — % stocks above 20-day MA
+      pct_above_50:   float (0-100) — % stocks above 50-day MA
+      source:         str  — which tier succeeded
+      history_20:     list of (date, value) — last 10 readings for trend
+      trend_20:       str  — "rising", "falling", "flat"
+      divergence:     bool — SPY up but breadth falling (key warning signal)
+    """
+    import re
+
+    result = {
+        "pct_above_20": None,
+        "pct_above_50": None,
+        "source":       None,
+        "history_20":   [],
+        "trend_20":     None,
+        "divergence":   False,
+    }
+
+    # ── TIER 1: yfinance breadth tickers ─────────────────────
+    try:
+        t20 = yf.Ticker("^S5TW")
+        h20 = t20.history(period="3mo", auto_adjust=True)
+        t50 = yf.Ticker("^S5FI")
+        h50 = t50.history(period="1mo", auto_adjust=True)
+
+        if not h20.empty and not h50.empty:
+            pct20 = round(float(h20["Close"].iloc[-1]), 1)
+            pct50 = round(float(h50["Close"].iloc[-1]), 1)
+
+            # Only accept if values are in sensible range (0-100)
+            if 0 < pct20 < 100 and 0 < pct50 < 100:
+                result["pct_above_20"] = pct20
+                result["pct_above_50"] = pct50
+                result["source"]       = "🟢 yfinance (^S5TW / ^S5FI)"
+
+                # Build 10-day history for trend line
+                last10 = h20.tail(10)
+                result["history_20"] = [
+                    (str(idx.date()), round(float(val), 1))
+                    for idx, val in zip(last10.index, last10["Close"])
+                ]
+
+                # Trend: compare last 5 days vs prior 5 days
+                if len(h20) >= 10:
+                    recent = float(h20["Close"].tail(5).mean())
+                    prior  = float(h20["Close"].tail(10).head(5).mean())
+                    diff   = recent - prior
+                    result["trend_20"] = (
+                        "rising"  if diff >  2 else
+                        "falling" if diff < -2 else
+                        "flat"
+                    )
+                return result
+    except Exception:
+        pass   # fall through to Tier 2
+
+    # ── TIER 2: Barchart — text-based regex, NOT CSS classes ──
+    # We search the raw HTML for stable text identifiers rather than
+    # div class names which change with every site redesign.
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+
+        # Try Barchart's market overview breadth page
+        url = "https://www.barchart.com/stocks/market-breadth"
+        r   = requests.get(url, headers=headers, timeout=12)
+
+        if r.status_code == 200:
+            text = r.text
+
+            # Search for 20-day breadth value using text proximity matching.
+            # Strategy: find the text identifier, then search nearby for a number.
+            # This is resilient because the identifier text is content (stable)
+            # while the surrounding HTML structure may change.
+
+            pct20 = None
+            pct50 = None
+
+            # Pattern: look for "20" or "Twenty" near a percentage in context
+            # Barchart typically shows these as "XX.XX%" near column headers
+            # We match: optional digit(s), decimal, % — bounded to 0-100
+            num_pattern = r'([0-9]{1,2}(?:\.[0-9]{1,2})?)'
+
+            # Try multiple text anchors in case page structure varies
+            anchors_20 = [
+                r"(?i)above\s+20[-\s]day",
+                r"(?i)20[-\s]day\s+ma",
+                r"[$]S5TW",
+                r"(?i)percent.*?20\s*per",
+            ]
+            anchors_50 = [
+                r"(?i)above\s+50[-\s]day",
+                r"(?i)50[-\s]day\s+ma",
+                r"[$]S5FI",
+                r"(?i)percent.*?50\s*per",
+            ]
+
+            for anchor in anchors_20:
+                m = re.search(anchor, text)
+                if m:
+                    # Search 300 chars after the anchor for a number
+                    nearby = text[m.start():m.start() + 300]
+                    nums   = re.findall(num_pattern, nearby)
+                    for n in nums:
+                        v = float(n)
+                        if 5 < v < 100:   # sanity check
+                            pct20 = v
+                            break
+                if pct20:
+                    break
+
+            for anchor in anchors_50:
+                m = re.search(anchor, text)
+                if m:
+                    nearby = text[m.start():m.start() + 300]
+                    nums   = re.findall(num_pattern, nearby)
+                    for n in nums:
+                        v = float(n)
+                        if 5 < v < 100:
+                            pct50 = v
+                            break
+                if pct50:
+                    break
+
+            if pct20:
+                result["pct_above_20"] = pct20
+                result["pct_above_50"] = pct50
+                result["source"]       = "🟡 Barchart (text regex)"
+                return result
+
+    except Exception:
+        pass   # fall through to Tier 3
+
+    # ── TIER 3: Own universe proxy ────────────────────────────
+    # Downloads 20-day MA for every stock in our universe.
+    # Not true S&P 500 breadth but directionally accurate.
+    try:
+        all_stocks = list(STOCK_UNIVERSE.keys()) + list(SMALL_CAP_UNIVERSE.keys())
+        raw = yf.download(
+            all_stocks, period="2mo", interval="1d",
+            auto_adjust=True, progress=False
+        )
+        if isinstance(raw.columns, pd.MultiIndex):
+            closes = raw["Close"]
+        else:
+            closes = raw
+
+        above_20 = []
+        above_50 = []
+
+        for ticker in all_stocks:
+            if ticker not in closes.columns:
+                continue
+            s = closes[ticker].dropna()
+            if len(s) < 20:
+                continue
+            price  = float(s.iloc[-1])
+            ma20   = float(s.tail(20).mean())
+            above_20.append(price > ma20)
+            if len(s) >= 50:
+                ma50 = float(s.tail(50).mean())
+                above_50.append(price > ma50)
+
+        if above_20:
+            result["pct_above_20"] = round(sum(above_20) / len(above_20) * 100, 1)
+        if above_50:
+            result["pct_above_50"] = round(sum(above_50) / len(above_50) * 100, 1)
+        result["source"] = f"🔴 Own universe proxy ({len(above_20)} stocks)"
+
+        # Trend for proxy
+        if len(above_20) > 0:
+            # Sample weekly: compare this week vs last week
+            recent_stocks = closes[all_stocks].dropna(how="all")
+            if len(recent_stocks) >= 10:
+                def breadth_at(n_ago):
+                    row = recent_stocks.iloc[-n_ago] if n_ago > 0 else recent_stocks.iloc[-1]
+                    ma  = recent_stocks.tail(20 + n_ago).mean()
+                    return sum(row > ma) / len([x for x in row if not pd.isna(x)])
+
+                now  = breadth_at(0)
+                week = breadth_at(5)
+                result["trend_20"] = (
+                    "rising"  if now - week >  0.04 else
+                    "falling" if now - week < -0.04 else
+                    "flat"
+                )
+
+    except Exception:
+        pass
+
+    return result
+
+
+def interpret_breadth(b, spy_chg_1d=None):
+    """
+    Converts breadth numbers into plain-English signals
+    and detects the key divergence warning.
+
+    Divergence = SPY rising but breadth falling
+    This is the most valuable signal — it means the index is
+    being held up by a few mega-caps while the majority of
+    stocks are already rolling over. Options implication:
+    favour put income plays and reduce call exposure.
+    """
+    if not b or b.get("pct_above_20") is None:
+        return None
+
+    pct = b["pct_above_20"]
+    trend = b.get("trend_20", "flat")
+
+    # Level signal
+    if pct >= 80:
+        level_sig  = "🔴 Overbought"
+        level_note = (
+            f"{pct:.0f}% of stocks above 20MA — market is stretched. "
+            "When breadth is this high, pullbacks are more likely than breakouts. "
+            "Income plays (selling premium) are favoured. Tighten stops on calls."
+        )
+    elif pct >= 60:
+        level_sig  = "🟢 Healthy"
+        level_note = (
+            f"{pct:.0f}% of stocks above 20MA — broad participation. "
+            "Calls on leading sectors are supported. Risk-on environment confirmed."
+        )
+    elif pct >= 40:
+        level_sig  = "🟡 Neutral"
+        level_note = (
+            f"{pct:.0f}% of stocks above 20MA — mixed breadth. "
+            "Be selective. Stick to the strongest sectors from the ETF screener."
+        )
+    elif pct >= 20:
+        level_sig  = "🟠 Weak"
+        level_note = (
+            f"{pct:.0f}% of stocks above 20MA — majority below their average. "
+            "Market is under pressure. Put bias. "
+            "Income plays on weak sectors. Avoid naked calls."
+        )
+    else:
+        level_sig  = "🟢 Oversold Bounce Risk"
+        level_note = (
+            f"{pct:.0f}% of stocks above 20MA — deeply oversold. "
+            "Paradoxically this can be a call opportunity on a bounce. "
+            "Watch for VIX spike + breadth this low = short-term reversal setup."
+        )
+
+    # Trend signal
+    if trend == "rising":
+        trend_note = "Breadth improving — more stocks recovering. Supportive for calls."
+    elif trend == "falling":
+        trend_note = "Breadth deteriorating — fewer stocks participating in any rally."
+    else:
+        trend_note = "Breadth stable — no strong directional signal from trend."
+
+    # Divergence detection — the most important signal
+    divergence = False
+    div_note   = ""
+    if spy_chg_1d and spy_chg_1d > 0.3 and trend == "falling":
+        divergence = True
+        div_note   = (
+            f"⚠️ DIVERGENCE DETECTED: SPY up {spy_chg_1d:+.1f}% today but breadth is FALLING. "
+            "The index is being held up by a handful of mega-caps (likely NVDA, MSFT, AAPL) "
+            "while the majority of stocks are rolling over underneath. "
+            "This is a high-conviction warning signal — historically resolves with the index "
+            "catching down to breadth within 1-3 weeks. "
+            "Action: reduce call exposure, add put income plays, tighten stops."
+        )
+    elif spy_chg_1d and spy_chg_1d < -0.3 and trend == "rising":
+        div_note = (
+            f"✅ POSITIVE DIVERGENCE: SPY down {spy_chg_1d:+.1f}% today but breadth is RISING. "
+            "More stocks are recovering than the index suggests. "
+            "This is a bullish signal — the selloff is concentrated in a few large stocks. "
+            "Action: consider buying calls on dips in leading sectors."
+        )
+
+    return {
+        "level_sig":  level_sig,
+        "level_note": level_note,
+        "trend_note": trend_note,
+        "divergence": divergence,
+        "div_note":   div_note,
+        "pct":        pct,
+        "trend":      trend,
+    }
 
 # ============================================================
 # UI HELPERS
@@ -1574,7 +2144,19 @@ with st.sidebar:
 # ============================================================
 
 macro = fetch_macro_snapshot()
+cross = fetch_cross_asset(macro)
+
+# Update GBP/USD live rate if available
+if cross.get("gbpusd_live"):
+    GBPUSD = cross["gbpusd_live"]
+
 regime_label, regime_colour, regime_desc, regime_bias = detect_regime_quick(macro)
+scenarios = analyse_scenarios(macro, cross)
+
+# Breadth (cached 30 min — daily signal not intraday)
+breadth        = fetch_breadth()
+spy_chg_1d     = macro.get("SPY", {}).get("chg_1d")
+breadth_interp = interpret_breadth(breadth, spy_chg_1d)
 
 vix_data  = macro.get("VIX", {})
 vix_val   = vix_data.get("price")
@@ -1599,6 +2181,12 @@ st.caption(
     "**Workflow:** Read the regime banner → check Trade Ideas → "
     "confirm sector in ETF Screener → verify on IBKR → execute manually."
 )
+
+# Divergence alert — shown prominently if detected
+if breadth_interp and breadth_interp.get("divergence"):
+    st.error(breadth_interp["div_note"])
+elif breadth_interp and breadth_interp.get("div_note") and "POSITIVE" in breadth_interp["div_note"]:
+    st.success(breadth_interp["div_note"])
 
 
 # ============================================================
@@ -1842,6 +2430,254 @@ with tab_macro:
                 st.warning("🟡 Flat curve — financials neutral. Prefer shorter expiries.")
             else:
                 st.success("🟢 Normal curve — financials have tailwind. LEAPS viable on strong trends.")
+
+    st.divider()
+
+    # ── Cross-Asset Signals ───────────────────────────────────
+    st.markdown("### 🌐 Cross-Asset Signals — Currencies, Commodities & REITs")
+    st.caption(
+        "These signals go beyond the basic macro indicators. "
+        "Currencies tell you where growth is and what your GBP capital is actually worth today. "
+        "Copper and silver tell you what industry thinks before equities react. "
+        "REITs tell you what rate expectations are doing. "
+        "Together they form the scenario analysis below."
+    )
+
+    # Metric grid — currencies
+    st.markdown("**Currencies (all changes vs USD today)**")
+    cx1, cx2, cx3, cx4, cx5 = st.columns(5)
+    curr_metrics = [
+        ("GBP/USD", "GBP/USD 💷", "gbpusd_chg", "Your capital currency. Rising = GBP stronger = US profits buy more pounds."),
+        ("EUR/USD", "EUR/USD", "eurusd_chg", "European growth signal. Rising EUR = risk-on globally."),
+        ("USD/JPY", "USD/JPY", "usdjpy_chg", "Risk appetite. Falling = yen strengthening = risk-off / carry unwind."),
+        ("AUD/USD", "AUD/USD", "audusd_chg", "China & commodity proxy. Rising = global growth picking up."),
+        ("USD/CAD", "USD/CAD", "usdcad_chg", "Oil proxy. Rising USD/CAD = oil/CAD under pressure."),
+    ]
+    for col, (mkey, label, ckey, tip) in zip([cx1,cx2,cx3,cx4,cx5], curr_metrics):
+        v = macro.get(mkey, {})
+        cv = cross.get(ckey)
+        with col:
+            if v and cv is not None:
+                p = v.get("price", 0)
+                delta_c = "inverse" if mkey == "USD/JPY" or mkey == "USD/CAD" else "normal"
+                col.metric(label, f"{p:.4f}", delta=f"{cv:+.3f}", help=tip)
+            else:
+                col.metric(label, "N/A")
+
+    st.markdown("**Commodities**")
+    cm1, cm2, cm3, cm4, cm5 = st.columns(5)
+    comm_metrics = [
+        ("Copper",      "Copper",      "copper_chg",  "Best global growth leading indicator. Moves 4-6 weeks before GDP data."),
+        ("Silver",      "Silver",      "silver_chg",  "Industrial + safe haven. Outperforming gold = industrial demand rising."),
+        ("Natural Gas", "Nat Gas",     "natgas_chg",  "Energy cost signal. Seasonal. Surging = inflation risk."),
+        ("Wheat",       "Wheat",       "wheat_chg",   "Food inflation proxy. Rising = consumer staples margin pressure."),
+        ("Crude Oil",   "Crude Oil",   None,          "Already shown above — key stagflation input."),
+    ]
+    for col, (mkey, label, ckey, tip) in zip([cm1,cm2,cm3,cm4,cm5], comm_metrics):
+        v = macro.get(mkey, {})
+        cv = cross.get(ckey) if ckey else v.get("chg_1d")
+        with col:
+            if v and cv is not None:
+                col.metric(label, f"{v.get('price',0):.2f}", delta=f"{cv:+.2f}%", help=tip)
+            else:
+                col.metric(label, "N/A")
+
+    # Derived ratios
+    st.markdown("**Derived Ratios**")
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        sg = cross.get("sg_ratio")
+        if sg:
+            st.metric("Silver/Gold Ratio", f"{sg:.4f}",
+                      help="Rising = industrial demand > fear. Good for cyclicals, materials.")
+            if cross.get("silver_chg") and cross.get("silver_chg",0) > (macro.get("Gold",{}).get("chg_1d",0) or 0) + 0.3:
+                st.success("🟢 Silver outperforming Gold — industrial demand signal")
+            elif cross.get("silver_chg",0) < (macro.get("Gold",{}).get("chg_1d",0) or 0) - 0.5:
+                st.warning("🔴 Gold outperforming Silver — fear > growth")
+    with r2:
+        cg = cross.get("cg_ratio")
+        if cg:
+            st.metric("Copper/Gold Ratio", f"{cg:.5f}",
+                      help="Rising = growth beating fear. Falling = fear dominating. Best single cross-asset signal.")
+    with r3:
+        rb = cross.get("reit_bond")
+        if rb:
+            st.metric("REIT vs Bond Signal", rb[0])
+            st.caption(rb[1])
+
+    st.divider()
+
+    # ── Scenario Analysis ─────────────────────────────────────
+    st.markdown("### 🎯 Active Market Scenarios & Trade Implications")
+    st.caption(
+        "Automatically detects which scenarios are active based on today's cross-asset moves. "
+        "More confirming signals = higher confidence. "
+        "Each scenario tells you specifically what to buy, sell, or avoid."
+    )
+
+    if not scenarios:
+        st.info(
+            "No strong cross-asset scenarios detected today. "
+            "Signals are mixed or moves are too small to confirm a theme. "
+            "Use the standard regime banner and sector screener as your guide."
+        )
+    else:
+        conf_labels = {1: "🟡 Emerging", 2: "🟠 Developing", 3: "🟢 Confirmed", 4: "🟢 Strong", 5: "🔴 Dominant"}
+        for sc in scenarios:
+            conf    = sc["confidence"]
+            conf_lbl = conf_labels.get(conf, f"⚡ {conf} signals")
+            with st.expander(
+                f"{sc['name']}  —  {conf_lbl} ({conf} signal{'s' if conf > 1 else ''} confirming)  ▼",
+                expanded=(conf >= 3)
+            ):
+                # What's happening
+                st.markdown(f"**What's happening:** {sc['what']}")
+                st.markdown("**Confirming signals:**")
+                for sig in sc["signals"]:
+                    st.markdown(f"  • {sig}")
+
+                st.divider()
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    if sc.get("buy_calls"):
+                        st.markdown("**📈 Buy Calls on:**")
+                        for item in sc["buy_calls"]:
+                            st.markdown(f"  • {item}")
+                    if sc.get("income"):
+                        st.markdown("**💰 Income Plays:**")
+                        for item in sc["income"]:
+                            st.markdown(f"  • {item}")
+                with tc2:
+                    if sc.get("buy_puts"):
+                        st.markdown("**📉 Buy Puts on:**")
+                        for item in sc["buy_puts"]:
+                            st.markdown(f"  • {item}")
+                    if sc.get("avoid"):
+                        st.markdown("**⛔ Avoid:**")
+                        for item in sc["avoid"]:
+                            st.markdown(f"  • {item}")
+
+                if sc.get("gbp_note"):
+                    st.info(f"💷 **GBP note:** {sc['gbp_note']}")
+
+    st.divider()
+
+    # ── Market Breadth ────────────────────────────────────────
+    st.markdown("### 📊 S&P 500 Market Breadth")
+    st.caption(
+        "% of S&P 500 stocks above their moving averages. "
+        "More reliable than index price alone — "
+        "the index can hold up while the majority of stocks roll over underneath. "
+        f"Source: **{breadth.get('source', 'loading...')}**"
+    )
+
+    if not breadth_interp:
+        st.info("Breadth data loading or unavailable. Falling back to sector analysis.")
+    else:
+        b_pct   = breadth_interp["pct"]
+        b_trend = breadth_interp["trend"]
+        b50_pct = breadth.get("pct_above_50")
+
+        # Metric tiles
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            arrow = "↑" if b_trend == "rising" else ("↓" if b_trend == "falling" else "→")
+            st.metric(
+                "% Above 20-Day MA",
+                f"{b_pct:.0f}%",
+                delta=f"{arrow} {b_trend}",
+                help="The most sensitive breadth signal for options trading. "
+                     "Rising = healthy market. Falling while SPY rises = warning."
+            )
+        with bc2:
+            if b50_pct:
+                st.metric(
+                    "% Above 50-Day MA",
+                    f"{b50_pct:.0f}%",
+                    help="Slower signal. Useful for confirming trend direction over weeks."
+                )
+        with bc3:
+            # Spread between 20-day and 50-day breadth
+            if b50_pct:
+                spread_b = round(b_pct - b50_pct, 1)
+                st.metric(
+                    "20MA vs 50MA Spread",
+                    f"{spread_b:+.0f}%",
+                    delta="expanding" if spread_b > 5 else ("contracting" if spread_b < -5 else "stable"),
+                    help="Positive spread = short-term breadth stronger than medium-term = momentum. "
+                         "Negative = short-term weakening faster = caution."
+                )
+
+        # Level signal
+        if breadth_interp["level_sig"] in ("🔴 Overbought",):
+            st.warning(f"**{breadth_interp['level_sig']}** — {breadth_interp['level_note']}")
+        elif "Oversold" in breadth_interp["level_sig"]:
+            st.warning(f"**{breadth_interp['level_sig']}** — {breadth_interp['level_note']}")
+        elif "Healthy" in breadth_interp["level_sig"]:
+            st.success(f"**{breadth_interp['level_sig']}** — {breadth_interp['level_note']}")
+        else:
+            st.info(f"**{breadth_interp['level_sig']}** — {breadth_interp['level_note']}")
+
+        # Trend signal
+        st.markdown(f"**Trend:** {breadth_interp['trend_note']}")
+
+        # Divergence — most important
+        if breadth_interp["div_note"]:
+            if breadth_interp["divergence"]:
+                st.error(breadth_interp["div_note"])
+            else:
+                st.success(breadth_interp["div_note"])
+
+        # 10-day history chart
+        hist = breadth.get("history_20", [])
+        if len(hist) >= 5:
+            hist_df = pd.DataFrame(hist, columns=["Date", "% Above 20MA"])
+            fig_b = px.line(
+                hist_df, x="Date", y="% Above 20MA",
+                title="% S&P 500 Stocks Above 20-Day MA — 10 Day History",
+                markers=True,
+            )
+            # Add reference bands
+            fig_b.add_hline(y=80, line_dash="dash", line_color="red",
+                            annotation_text="Overbought (80%)")
+            fig_b.add_hline(y=60, line_dash="dot", line_color="green",
+                            annotation_text="Healthy (60%)")
+            fig_b.add_hline(y=40, line_dash="dot", line_color="orange",
+                            annotation_text="Caution (40%)")
+            fig_b.add_hline(y=20, line_dash="dash", line_color="red",
+                            annotation_text="Oversold (20%)")
+            fig_b.update_layout(height=280, yaxis_range=[0, 100])
+            st.plotly_chart(fig_b, use_container_width=True)
+
+        # Explain the divergence signal clearly
+        with st.expander("📖 How to use breadth for options timing", expanded=False):
+            st.markdown("""
+**Why breadth matters more than index price:**
+
+SPY and QQQ are cap-weighted — NVDA, MSFT, and AAPL alone represent ~20% of QQQ.
+If these three stocks rally while 400 others are flat or falling, QQQ goes up
+but the market is actually weak underneath. The index lies. Breadth doesn't.
+
+**The four situations and what to do:**
+
+| Breadth | SPY | What it means | Your action |
+|---------|-----|--------------|-------------|
+| High + Rising | Up | Genuine broad rally | Buy calls on leaders, sell puts below support |
+| High + Falling | Up | ⚠️ Divergence — index held up by mega-caps | Reduce calls, add put income plays, tighten stops |
+| Low + Rising | Down | Positive divergence — weakness concentrated | Buy calls on dips, stocks are recovering |
+| Low + Falling | Down | Broad market selloff | Buy puts on weak sectors, sell call spreads |
+
+**The divergence signal specifically:**
+When >60% of stocks are above their 20MA but breadth is falling week-over-week,
+the next 1-3 weeks tend to resolve with the index falling to match breadth.
+This typically gives you 5-10 trading days to position — enough time for
+21-30 DTE put options or put credit spreads to profit.
+
+**Overbought ≠ sell immediately:**
+Breadth above 80% means the rally is extended, not that it ends today.
+Markets can stay overbought for weeks. Use it to tighten stops and avoid
+chasing — not to go aggressively short.
+            """)
 
     st.divider()
 
