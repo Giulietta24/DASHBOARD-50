@@ -592,7 +592,7 @@ def fetch_stock_data(ticker):
         return None
 
 
-def generate_income_idea(d, regime_bias):
+def generate_income_idea(d, regime_bias, vix_val=None):
     """
     Given stock data dict, generate an income (sell premium) trade idea.
     Returns dict with trade details or None if stock not suitable.
@@ -762,7 +762,7 @@ def generate_income_idea(d, regime_bias):
     }
 
 
-def generate_growth_idea(d, regime_bias, sector_strong=True):
+def generate_growth_idea(d, regime_bias, sector_strong=True, vix_val=None):
     """
     Given stock data dict, generate a growth (buy options) trade idea.
     Returns dict with trade details or None if stock not suitable.
@@ -1051,7 +1051,7 @@ def fetch_fundamentals(ticker):
 
 
 @st.cache_data(ttl=300)
-def scan_small_cap_options():
+def scan_small_cap_options(vix_val=None):
     """
     Scans small cap universe for options trade candidates.
     Reuses fetch_stock_data for options metrics.
@@ -1075,13 +1075,14 @@ def scan_small_cap_options():
             if fund.get("fcf") and fund["fcf"] < 0 and (fund.get("op_cf") or 0) < 0:
                 continue   # burning cash = too risky for selling premium
 
-        inc = generate_income_idea(d, "neutral")
+        inc = generate_income_idea(d, "neutral", vix_val=vix_val)
         if inc:
             inc["is_small_cap"] = True
             income.append(inc)
 
         gr = generate_growth_idea(d, "neutral",
-                                  sector_strong=(fund and (fund.get("rs_vs_iwm") or 0) >= 0))
+                                  sector_strong=(fund and (fund.get("rs_vs_iwm") or 0) >= 0),
+                                  vix_val=vix_val)
         if gr:
             gr["is_small_cap"] = True
             growth.append(gr)
@@ -1101,15 +1102,18 @@ def scan_investment_watchlist():
     """
     results = []
     for ticker in SMALL_CAP_UNIVERSE:
-        fund = fetch_fundamentals(ticker)
-        if fund:
-            results.append(fund)
+        try:
+            fund = fetch_fundamentals(ticker)
+            if fund:
+                results.append(fund)
+        except Exception:
+            pass   # never let one bad ticker crash the whole scan
         time.sleep(0.2)
     results.sort(key=lambda x: x["q_score"], reverse=True)
     return results
 
 @st.cache_data(ttl=300)
-def fetch_all_candidates():
+def fetch_all_candidates(vix_val=None):
     """
     Scan all stocks in STOCK_UNIVERSE and return
     income and growth candidates sorted by score.
@@ -1122,11 +1126,11 @@ def fetch_all_candidates():
         if not d:
             continue
 
-        income = generate_income_idea(d, "neutral")
+        income = generate_income_idea(d, "neutral", vix_val=vix_val)
         if income:
             income_candidates.append(income)
 
-        growth = generate_growth_idea(d, "neutral")
+        growth = generate_growth_idea(d, "neutral", vix_val=vix_val)
         if growth:
             growth_candidates.append(growth)
 
@@ -2252,7 +2256,7 @@ with tab_ideas:
 
     if st.button("🔄 Scan for Trade Ideas", type="primary", key="scan_btn"):
         with st.spinner("Scanning all stocks... this takes ~60 seconds..."):
-            income_list, growth_list = fetch_all_candidates()
+            income_list, growth_list = fetch_all_candidates(vix_val=vix_val)
         st.session_state["income_list"] = income_list
         st.session_state["growth_list"] = growth_list
 
@@ -2409,6 +2413,76 @@ with tab_macro:
                           help=tip)
             else:
                 st.metric(label, "N/A")
+
+    # ── Credit Risk Row ──────────────────────────────────────────
+    # HYG is the most important early warning signal in the dashboard.
+    # Show it prominently, not buried in an expander.
+    hyg_d  = macro.get("HYG", {})
+    tlt_d  = macro.get("TLT", {})
+    cr1, cr2, cr3 = st.columns(3)
+    with cr1:
+        if hyg_d:
+            chg   = hyg_d.get("chg_1d", 0) or 0
+            colour = "normal" if chg >= 0 else "inverse"
+            st.metric(
+                "HYG — High Yield Credit 🚨",
+                f"${hyg_d.get('price', 0):.2f}",
+                delta=f"{chg:+.2f}% today",
+                delta_color=colour,
+                help=(
+                    "THE most reliable early warning signal. "
+                    "HYG falling while SPY holds up = credit stress = equities follow down. "
+                    "HYG rising = credit healthy = risk-on confirmed. "
+                    "Watch this more than anything else."
+                )
+            )
+            if chg <= -1:
+                st.error(f"⚠️ HYG down {chg:.2f}% — credit stress. Reduce call exposure.")
+            elif chg <= -0.5:
+                st.warning(f"HYG down {chg:.2f}% — mild credit concern. Monitor.")
+            elif chg >= 0.5:
+                st.success(f"HYG up {chg:.2f}% — credit healthy. Risk-on confirmed.")
+        else:
+            st.metric("HYG — High Yield Credit", "N/A")
+
+    with cr2:
+        if tlt_d:
+            chg = tlt_d.get("chg_1d", 0) or 0
+            st.metric(
+                "TLT — Long Bonds",
+                f"${tlt_d.get('price', 0):.2f}",
+                delta=f"{chg:+.2f}% today",
+                help=(
+                    "TLT rising = rates falling = bonds being bought = risk-off or rate-cut expectations. "
+                    "TLT falling = rates rising = headwind for growth stocks and REITs."
+                )
+            )
+            if chg >= 1:
+                st.info("Bonds rallying — flight to safety or rate-cut bets increasing.")
+            elif chg <= -1:
+                st.warning("Bonds selling off — rates rising. Headwind for tech/REITs.")
+        else:
+            st.metric("TLT — Long Bonds", "N/A")
+
+    with cr3:
+        # HYG vs SPY divergence — the signal within the signal
+        hyg_chg = hyg_d.get("chg_1d", 0) or 0
+        spy_chg = macro.get("SPY", {}).get("chg_1d", 0) or 0
+        div = round(spy_chg - hyg_chg, 2)
+        st.metric(
+            "SPY vs HYG Divergence",
+            f"{div:+.2f}%",
+            delta="⚠️ Warning" if div >= 1.0 else ("✅ Aligned" if abs(div) < 0.5 else "Watch"),
+            help=(
+                "SPY up but HYG flat/down = credit not confirming the equity move. "
+                "Historically resolves with SPY falling to meet HYG. "
+                "A divergence >1% is a high-conviction warning."
+            )
+        )
+        if div >= 1.0:
+            st.error(f"SPY outperforming HYG by {div:.2f}% — equities not confirmed by credit.")
+        elif div <= -1.0:
+            st.success(f"Credit leading equities by {abs(div):.2f}% — bullish divergence.")
 
     # Yield curve spread
     y10 = macro.get("10Y Treasury", {}).get("price")
@@ -3488,7 +3562,7 @@ with tab_smallcap:
 
     if st.button("🔬 Scan Small Cap Options", type="primary", key="sc_scan"):
         with st.spinner("Scanning small cap universe (~90 seconds)..."):
-            sc_income, sc_growth = scan_small_cap_options()
+            sc_income, sc_growth = scan_small_cap_options(vix_val=vix_val)
         st.session_state["sc_income"] = sc_income
         st.session_state["sc_growth"] = sc_growth
 
