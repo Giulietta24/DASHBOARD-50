@@ -29,6 +29,32 @@ try:
 except ImportError:
     _SUPABASE_AVAILABLE = False
 
+# ── yfinance reliability fixes for Streamlit Cloud ────────────
+# Streamlit Cloud shares IPs — Yahoo Finance rate-limits shared hosts.
+# Fix 1: set a browser-like User-Agent via a persistent requests session
+# Fix 2: set tz cache to /tmp (writable on Streamlit Cloud)
+# Fix 3: disable auto-adjust warnings
+import yfinance as yf
+import requests as _req
+
+_yf_session = _req.Session()
+_yf_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+})
+
+try:
+    yf.set_tz_cache_location("/tmp")
+except Exception:
+    pass
+
 st.set_page_config(
     page_title="Options Trading Dashboard",
     page_icon="🎯",
@@ -287,7 +313,7 @@ def fetch_macro_snapshot():
     result = {}
     for name, ticker in MACRO_TICKERS.items():
         try:
-            t    = yf.Ticker(ticker)
+            t    = yf.Ticker(ticker, session=_yf_session)
             info = t.info
             price = (info.get("regularMarketPrice")
                      or info.get("currentPrice")
@@ -391,7 +417,7 @@ def fetch_stock_data(ticker):
     price, IV, HV30, earnings, momentum, 52W range.
     """
     try:
-        t    = yf.Ticker(ticker)
+        t    = yf.Ticker(ticker, session=_yf_session)
         info = t.info
         price = safe_float(
             info.get("regularMarketPrice") or info.get("currentPrice")
@@ -573,6 +599,9 @@ def fetch_stock_data(ticker):
                 is_range_bound = atr < atr_30 * 0.85  # ATR 15% below 30-day avg
         except Exception:
             pass
+
+        if not price:
+            return None   # don't cache — let the next call retry
 
         return {
             "ticker":          ticker,
@@ -917,7 +946,7 @@ def fetch_fundamentals(ticker):
       P/E or P/S      — are you paying a reasonable price for the growth?
     """
     try:
-        t    = yf.Ticker(ticker)
+        t    = yf.Ticker(ticker, session=_yf_session)
         info = t.info
 
         # Price and market cap
@@ -1637,9 +1666,9 @@ def fetch_breadth():
 
     # ── TIER 1: yfinance breadth tickers ─────────────────────
     try:
-        t20 = yf.Ticker("^S5TW")
+        t20 = yf.Ticker("^S5TW", session=_yf_session)
         h20 = t20.history(period="3mo", auto_adjust=True)
-        t50 = yf.Ticker("^S5FI")
+        t50 = yf.Ticker("^S5FI", session=_yf_session)
         h50 = t50.history(period="1mo", auto_adjust=True)
 
         if not h20.empty and not h50.empty:
@@ -2367,7 +2396,7 @@ elif breadth_interp and breadth_interp.get("div_note") and "POSITIVE" in breadth
 # MAIN TABS
 # ============================================================
 
-tab_ideas, tab_macro, tab_sectors, tab_holdings, tab_options, tab_smallcap, tab_invest, tab_journal = st.tabs([
+tab_ideas, tab_macro, tab_sectors, tab_holdings, tab_options, tab_smallcap, tab_invest, tab_journal, tab_diag = st.tabs([
     "🎯 Trade Ideas",
     "🌍 Macro",
     "📈 ETF Sectors",
@@ -2376,6 +2405,7 @@ tab_ideas, tab_macro, tab_sectors, tab_holdings, tab_options, tab_smallcap, tab_
     "🔬 Small Cap Options",
     "📊 Investment Watchlist",
     "📒 Trade Journal",
+    "🔧 Diagnostics",
 ])
 
 
@@ -4572,3 +4602,182 @@ with tab_journal:
 - Regime at entry lets you see if you're trading with or against the macro trend
 - It creates accountability — you can't fool yourself about performance
         """)
+
+
+# ============================================================
+# TAB 9 — DIAGNOSTICS
+# ============================================================
+# If other tabs show no data, run this first.
+# Shows exactly what yfinance is returning for a single stock
+# so you can see whether the issue is rate limiting, a bad
+# ticker, or something else.
+# ============================================================
+
+with tab_diag:
+    st.subheader("🔧 Diagnostics")
+    st.caption(
+        "If scans return 0 results, run these tests to find out why. "
+        "Yahoo Finance sometimes rate-limits Streamlit Cloud's shared IP. "
+        "The tests below show exactly what's being returned."
+    )
+
+    # ── Test 1: Single stock yfinance fetch ───────────────────
+    st.markdown("### Test 1 — Single Stock Data Fetch")
+    test_ticker = st.text_input(
+        "Test ticker",
+        value="NVDA",
+        help="Start with NVDA — it's highly liquid and should always return data."
+    ).upper()
+
+    if st.button("🧪 Run Test", key="diag_test"):
+        with st.spinner(f"Fetching {test_ticker}..."):
+            try:
+                t    = yf.Ticker(test_ticker, session=_yf_session)
+                info = t.info
+
+                price = info.get("regularMarketPrice") or info.get("currentPrice")
+                low52 = info.get("fiftyTwoWeekLow")
+                high52= info.get("fiftyTwoWeekHigh")
+                hist  = t.history(period="3mo", auto_adjust=True)
+
+                st.markdown("**Results:**")
+                dc1, dc2, dc3 = st.columns(3)
+                dc1.metric("Price",       f"${price:.2f}" if price else "❌ None")
+                dc2.metric("52W Low",     f"${low52:.2f}" if low52 else "❌ None")
+                dc3.metric("History rows",f"{len(hist)}"  if not hist.empty else "❌ Empty")
+
+                if price:
+                    st.success(f"✅ yfinance is working. {test_ticker} data fetched successfully.")
+                else:
+                    st.error(
+                        "❌ Price returned None. Yahoo Finance may be rate-limiting this IP. "
+                        "Try again in 30 seconds, or see solutions below."
+                    )
+
+                # Show raw info keys for debugging
+                with st.expander("Raw info dict (first 20 keys)", expanded=False):
+                    keys = list(info.keys())[:20]
+                    st.json({k: info.get(k) for k in keys})
+
+            except Exception as e:
+                st.error(f"❌ Exception: {type(e).__name__}: {e}")
+                st.markdown(
+                    "This confirms a connectivity issue. "
+                    "See solutions below."
+                )
+
+    # ── Test 2: Options chain ─────────────────────────────────
+    st.markdown("### Test 2 — Options Chain")
+    if st.button("🧪 Test Options Chain", key="diag_opts"):
+        with st.spinner("Fetching NVDA options..."):
+            try:
+                t     = yf.Ticker("NVDA", session=_yf_session)
+                dates = t.options
+                if dates:
+                    chain = t.option_chain(dates[0])
+                    cv    = chain.calls["volume"].fillna(0).sum()
+                    pv    = chain.puts["volume"].fillna(0).sum()
+                    st.success(
+                        f"✅ Options chain working. "
+                        f"Nearest expiry: {dates[0]} | "
+                        f"Calls vol: {cv:,.0f} | Puts vol: {pv:,.0f}"
+                    )
+                else:
+                    st.error("❌ No option dates returned. Yahoo Finance may be blocking options data.")
+            except Exception as e:
+                st.error(f"❌ Options chain failed: {type(e).__name__}: {e}")
+
+    # ── Test 3: Macro data ────────────────────────────────────
+    st.markdown("### Test 3 — Macro Data (VIX)")
+    if st.button("🧪 Test VIX", key="diag_vix"):
+        with st.spinner("Fetching VIX..."):
+            try:
+                t    = yf.Ticker("^VIX", session=_yf_session)
+                info = t.info
+                hist = t.history(period="5d")
+                price = info.get("regularMarketPrice")
+                st.success(
+                    f"✅ VIX: {price:.2f}" if price
+                    else f"⚠️ VIX price None but history has {len(hist)} rows"
+                )
+            except Exception as e:
+                st.error(f"❌ VIX failed: {e}")
+
+    # ── Solutions ─────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 🛠️ Solutions if yfinance is failing")
+
+    with st.expander("Solution 1 — Wait and retry (most common fix)", expanded=True):
+        st.markdown("""
+Yahoo Finance rate-limits by IP address. Streamlit Cloud uses shared IPs
+that sometimes get temporarily blocked after heavy use.
+
+**What to do:**
+1. Wait 2-3 minutes
+2. Click the scan button again
+3. If still failing after 5 minutes, try Solution 2
+
+The rate limit is temporary — it typically clears within 5 minutes.
+        """)
+
+    with st.expander("Solution 2 — Clear the Streamlit cache"):
+        st.markdown("""
+If a failed result was cached, clearing the cache forces a fresh attempt.
+
+**On Streamlit Cloud:**
+1. Click the three dots menu (⋮) in the top right
+2. Click **Clear cache**
+3. Wait 30 seconds
+4. Click the scan button again
+        """)
+        if st.button("🗑️ Clear cache now", key="clear_cache"):
+            st.cache_data.clear()
+            st.success("Cache cleared. Try scanning again.")
+
+    with st.expander("Solution 3 — yfinance version issue"):
+        st.markdown("""
+Sometimes a specific yfinance version breaks compatibility with Yahoo Finance.
+
+Check your current version is recent:
+```
+yfinance>=0.2.40
+```
+
+This is already set in requirements.txt. If Streamlit Cloud deployed
+an older version, force a redeploy:
+1. Make any small change to dashboard.py (add a space, save)
+2. Push to GitHub
+3. Streamlit Cloud will redeploy with fresh packages
+        """)
+
+    with st.expander("Solution 4 — Outside market hours?"):
+        st.markdown("""
+yfinance returns less data outside US market hours (9:30 AM – 4:00 PM ET):
+
+- **Options volume**: resets at market open — will show 0 outside hours
+- **Intraday VWAP**: only meaningful during market hours
+- **Price**: last closing price still available 24/7
+
+If you're running the dashboard outside market hours:
+- Macro data should still work
+- Trade Ideas scan may return fewer candidates (IV data is less reliable)
+- VWAP signals will reflect yesterday's session
+        """)
+
+    # Current environment info
+    st.divider()
+    st.markdown("### Environment Info")
+    import sys
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        st.code(f"Python: {sys.version.split()[0]}\nyfinance: {yf.__version__}\nstreamlit: {st.__version__}", language="text")
+    with ec2:
+        st.markdown(f"**Current time (UTC):** {pd.Timestamp.now('UTC').strftime('%Y-%m-%d %H:%M')}")
+        st.markdown(f"**US Market open:** 13:30 – 20:00 UTC")
+        now_utc = pd.Timestamp.now('UTC')
+        market_open  = now_utc.replace(hour=13, minute=30, second=0)
+        market_close = now_utc.replace(hour=20, minute=0,  second=0)
+        if market_open <= now_utc <= market_close and now_utc.weekday() < 5:
+            st.success("✅ US Market is OPEN right now")
+        else:
+            st.warning("⚠️ US Market is CLOSED — some data may be limited")
