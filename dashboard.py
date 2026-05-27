@@ -3398,9 +3398,11 @@ with tab_options:
 
             def _style_opts(row):
                 styles = [""] * len(row)
-                if "Signal" in row.index:
-                    i = list(row.index).index("Signal")
-                    sig = str(row["Signal"])
+                # Key is "IV Signal" after the rename
+                key = "IV Signal" if "IV Signal" in row.index else "Signal"
+                if key in row.index:
+                    i = list(row.index).index(key)
+                    sig = str(row[key])
                     if "Sell"  in sig: styles[i] = "background-color:#fecaca"
                     elif "Buy" in sig: styles[i] = "background-color:#bbf7d0"
                     elif "Fair" in sig: styles[i] = "background-color:#fef08a"
@@ -3497,8 +3499,8 @@ with tab_options:
 
             # Summary
             st.markdown("#### 🎯 Summary")
-            sell_list = [r["Ticker"] for r in results if "Sell" in r["Signal"]]
-            buy_list  = [r["Ticker"] for r in results if "Buy"  in r["Signal"]]
+            sell_list = [r["Ticker"] for r in results if "Sell" in r.get("IV Signal", "")]
+            buy_list  = [r["Ticker"] for r in results if "Buy"  in r.get("IV Signal", "")]
             sc1, sc2  = st.columns(2)
             with sc1:
                 if buy_list:
