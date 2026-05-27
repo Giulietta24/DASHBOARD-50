@@ -1,15 +1,7 @@
-# ============================================================
-# REQUIREMENTS — Options Trading Dashboard
-# ============================================================
-# Install with:  pip install -r requirements.txt
-#
-# Minimum versions tested against. Pin exact versions if you
-# want reproducible deploys on Streamlit Cloud.
-# ============================================================
-
-streamlit>=1.35.0       # UI framework — tabs, expanders, metrics
-yfinance>=0.2.40        # Yahoo Finance data — prices, options chains, fundamentals
-pandas>=2.0.0           # Data manipulation — DataFrames, resampling
-numpy>=1.26.0           # Numerical — log returns, volatility calculations
-plotly>=5.20.0          # Interactive charts — bar charts, line charts
-requests>=2.31.0        # HTTP — fetching ETF holdings from stockanalysis.com
+streamlit>=1.35.0
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.26.0
+plotly>=5.20.0
+requests>=2.31.0
+supabase>=2.0.0

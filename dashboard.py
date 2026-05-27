@@ -21,6 +21,14 @@ import yfinance as yf
 import plotly.express as px
 import plotly.graph_objects as go
 
+# Supabase — optional persistent journal storage
+# Falls back to session state if not configured
+try:
+    from supabase import create_client
+    _SUPABASE_AVAILABLE = True
+except ImportError:
+    _SUPABASE_AVAILABLE = False
+
 st.set_page_config(
     page_title="Options Trading Dashboard",
     page_icon="🎯",
@@ -1897,6 +1905,158 @@ def interpret_breadth(b, spy_chg_1d=None):
         "pct":        pct,
         "trend":      trend,
     }
+
+
+# ============================================================
+# SUPABASE JOURNAL HELPERS
+# ============================================================
+# All journal reads/writes go through these functions.
+# If Supabase is not configured they fall back to session state
+# transparently — no errors, no broken UI.
+# ============================================================
+
+def _get_supabase():
+    """
+    Returns a Supabase client if URL and key are in Streamlit secrets.
+    Returns None if not configured — triggers session state fallback.
+
+    To configure: Streamlit Cloud → App Settings → Secrets → add:
+        SUPABASE_URL = "https://yourproject.supabase.co"
+        SUPABASE_KEY = "your-anon-key"
+    """
+    if not _SUPABASE_AVAILABLE:
+        return None
+    try:
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY")
+        if url and key:
+            return create_client(url, key)
+    except Exception:
+        pass
+    return None
+
+
+def journal_load():
+    """
+    Loads all journal entries.
+    Priority: Supabase → session state.
+    Caches in session state after first Supabase load
+    to avoid repeated DB calls on every rerun.
+    """
+    sb = _get_supabase()
+
+    if sb:
+        # Only reload from DB if session state is empty
+        # (avoids a DB round-trip on every Streamlit rerun)
+        if "journal_loaded_from_db" not in st.session_state:
+            try:
+                resp = (
+                    sb.table("journal")
+                    .select("*")
+                    .order("created_at", desc=False)
+                    .execute()
+                )
+                rows = resp.data or []
+                # Normalise DB column names to match UI field names
+                normalised = []
+                for r in rows:
+                    normalised.append({
+                        "_id":           r.get("id"),
+                        "Date":          r.get("date", ""),
+                        "Ticker":        r.get("ticker", ""),
+                        "Type":          r.get("type", ""),
+                        "Premium $":     r.get("premium", 0),
+                        "Contracts":     r.get("contracts", 1),
+                        "Total Cost £":  r.get("total_cost_gbp", 0),
+                        "Expiry":        r.get("expiry", ""),
+                        "Regime":        r.get("regime", ""),
+                        "IV Rank ~":     r.get("iv_rank", 0),
+                        "Thesis":        r.get("thesis", ""),
+                        "Exit Price $":  r.get("exit_price"),
+                        "P&L £":         r.get("pnl_gbp"),
+                        "Result":        r.get("result", "Open"),
+                    })
+                st.session_state["journal"] = normalised
+                st.session_state["journal_loaded_from_db"] = True
+                st.session_state["journal_source"] = "🟢 Supabase (persistent)"
+            except Exception as e:
+                st.session_state["journal_source"] = f"🔴 DB error: {e} — using session state"
+        return st.session_state.get("journal", [])
+    else:
+        st.session_state["journal_source"] = "🟡 Session state only (configure Supabase to persist)"
+        if "journal" not in st.session_state:
+            st.session_state["journal"] = []
+        return st.session_state["journal"]
+
+
+def journal_add(entry: dict) -> bool:
+    """
+    Adds a new trade entry.
+    Writes to Supabase if configured, always updates session state.
+    Returns True on success, False on DB failure.
+    """
+    sb = _get_supabase()
+
+    if sb:
+        try:
+            db_row = {
+                "date":           entry["Date"],
+                "ticker":         entry["Ticker"],
+                "type":           entry["Type"],
+                "premium":        entry["Premium $"],
+                "contracts":      entry["Contracts"],
+                "total_cost_gbp": entry["Total Cost £"],
+                "expiry":         entry["Expiry"],
+                "regime":         entry["Regime"],
+                "iv_rank":        entry["IV Rank ~"],
+                "thesis":         entry["Thesis"],
+                "result":         "Open",
+            }
+            resp = sb.table("journal").insert(db_row).execute()
+            # Store the DB-assigned UUID so we can update later
+            if resp.data:
+                entry["_id"] = resp.data[0]["id"]
+        except Exception as e:
+            st.warning(f"Saved locally (DB write failed: {e})")
+
+    st.session_state["journal"].append(entry)
+    return True
+
+
+def journal_update(entry: dict, exit_price: float, pnl_gbp: float, result: str):
+    """
+    Updates an existing trade with exit data.
+    Writes to Supabase by UUID if configured.
+    """
+    sb   = _get_supabase()
+    uid  = entry.get("_id")
+
+    if sb and uid:
+        try:
+            sb.table("journal").update({
+                "exit_price": exit_price,
+                "pnl_gbp":    pnl_gbp,
+                "result":     result,
+            }).eq("id", uid).execute()
+        except Exception as e:
+            st.warning(f"Local update done (DB update failed: {e})")
+
+    # Always update session state
+    entry["Exit Price $"] = exit_price
+    entry["P&L £"]        = pnl_gbp
+    entry["Result"]       = result
+
+
+def journal_delete_all():
+    """Clears all journal entries from Supabase and session state."""
+    sb = _get_supabase()
+    if sb:
+        try:
+            sb.table("journal").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+        except Exception as e:
+            st.warning(f"DB clear failed: {e}")
+    st.session_state["journal"] = []
+    st.session_state.pop("journal_loaded_from_db", None)
 
 # ============================================================
 # UI HELPERS
