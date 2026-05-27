@@ -2102,11 +2102,21 @@ def render_trade_card(idea, regime_bias):
                     st.markdown("- ⚪ Earnings date unknown — verify on IBKR")
 
             st.divider()
+            est_c   = idea.get("est_cost", 100)
+            conts   = idea.get("contracts", 1)
+            target  = round(est_c * 2, 0)
+            stop    = round(est_c * 0.5, 0)
             st.markdown(
                 f"**On IBKR:** Options chain → select expiry ~21 days out → "
                 f"Buy {ticker} ${strike:.0f} {direction}. "
                 "Always check the bid/ask spread — if it's wider than $0.10, "
                 "use a limit order at the mid-price."
+            )
+            st.markdown(
+                f"**Set immediately after entry:**  \n"
+                f"🎯 Target sell order at **${target:.0f}/contract** (+100%)  \n"
+                f"🛑 Mental stop: exit if premium drops to **${stop:.0f}/contract** (-50%)  \n"
+                f"📅 Time stop: close before 7 DTE regardless of P&L — theta decay accelerates"
             )
 
 
@@ -2255,13 +2265,27 @@ with tab_ideas:
             )
 
     if st.button("🔄 Scan for Trade Ideas", type="primary", key="scan_btn"):
-        with st.spinner("Scanning all stocks... this takes ~60 seconds..."):
+        with st.spinner(
+            f"Scanning {len(STOCK_UNIVERSE)} stocks... ~60 seconds... "
+            f"(Regime: {regime_label} | VIX: {f'{vix_val:.0f}' if vix_val else 'N/A'})"
+        ):
             income_list, growth_list = fetch_all_candidates(vix_val=vix_val)
         st.session_state["income_list"] = income_list
         st.session_state["growth_list"] = growth_list
+        st.session_state["last_scan_time"] = pd.Timestamp.now().strftime("%H:%M")
 
     income_list = st.session_state.get("income_list", [])
     growth_list = st.session_state.get("growth_list", [])
+
+    last_scan = st.session_state.get("last_scan_time")
+    if last_scan:
+        inc_c = len(income_list)
+        gr_c  = len(growth_list)
+        st.caption(
+            f"Last scan: **{last_scan}** — "
+            f"found **{inc_c}** income candidates, **{gr_c}** growth candidates. "
+            "Cached for 5 minutes — click Scan to refresh."
+        )
 
     if not income_list and not growth_list:
         st.info("Click **Scan for Trade Ideas** above to find today's candidates.")
@@ -3178,7 +3202,7 @@ with tab_sectors:
                                         i = list(row.index).index("Status")
                                         s[i] = "background-color:#bbf7d0" if row["Status"] == "✅ Leading" else ("background-color:#fecaca" if row["Status"] == "⚠️ Lagging" else "")
                                     return s
-                                st.dataframe(h.style.apply(_hl, axis=1), use_container_width=True, hide_index=True)
+                                st.dataframe(h.style.apply(_hl_calls, axis=1), use_container_width=True, hide_index=True)
                                 leading = h[h.get("Status","") == "✅ Leading"]["Ticker"].tolist() if "Status" in h.columns else []
                                 if leading:
                                     st.success(f"Leading: {', '.join(leading)}")
@@ -3211,7 +3235,7 @@ with tab_sectors:
                                         i = list(row.index).index("Status")
                                         s[i] = "background-color:#bbf7d0" if row["Status"] == "✅ Leading" else ("background-color:#fecaca" if row["Status"] == "⚠️ Lagging" else "")
                                     return s
-                                st.dataframe(h.style.apply(_hl2, axis=1), use_container_width=True, hide_index=True)
+                                st.dataframe(h.style.apply(_hl_puts, axis=1), use_container_width=True, hide_index=True)
                                 lagging = h[h.get("Status","") == "⚠️ Lagging"]["Ticker"].tolist() if "Status" in h.columns else []
                                 if lagging:
                                     st.error(f"Put candidates: {', '.join(lagging)}")
@@ -3900,6 +3924,228 @@ Positive free cashflow = the business funds itself. Much safer.
                             "Don't chase — the fundamentals will still be here."
                         )
 
+        # ── Short Candidates ──────────────────────────────────────
+        # Only flag Avoid stocks that ALSO pass technical short criteria.
+        # Bad fundamentals alone ≠ good short. Need downtrend confirmation.
+        st.divider()
+        st.markdown("### 🩳 Short / Put Candidates")
+        st.caption(
+            "Avoid stocks filtered through a second technical layer. "
+            "A weak business is only a good short when it's also in a technical downtrend — "
+            "otherwise you risk a short squeeze or dead-cat bounce."
+        )
+
+        with st.expander("📖 Why not all Avoid stocks are shortable", expanded=False):
+            st.markdown("""
+**The four conditions that make a short actionable:**
+
+1. **Bad fundamentals** (score < 40) — the business is genuinely deteriorating
+2. **Declining revenue** — not just slow growth, actually shrinking
+3. **Poor relative strength vs IWM** (RS < -8%) — institutional money is already leaving
+4. **Near 52W low** (range < 30%) — the downtrend is established, not just starting
+
+**Why you need ALL four:**
+- A cheap, bad business can stay flat for years if the market lifts everything
+- A stock at 52W highs with bad fundamentals could be a short squeeze trap
+- Weak RS vs IWM means smart money has already voted with their feet
+- Revenue decline is the hardest fundamental to reverse — it compounds
+
+**The dangerous short traps to avoid:**
+- High short interest already (>20% float short) = squeeze risk is extreme
+- Near earnings = binary event, IV spikes against your puts
+- Very cheap stock (<$5) = options illiquid, spreads too wide to trade
+            """)
+
+        # Filter: Avoid stocks with technical short confirmation
+        avoid_stocks = [w for w in watchlist if w["verdict"] == "🔴 Avoid"]
+        short_candidates = []
+
+        for w in avoid_stocks:
+            score     = w.get("q_score", 100)
+            rev_g     = w.get("rev_growth") or 0
+            rs_iwm    = w.get("rs_vs_iwm") or 0
+            rng       = w.get("range_pct") or 50
+            de        = w.get("de_ratio") or 0
+            fcf       = w.get("fcf") or 0
+            price     = w.get("price") or 0
+            mom_1m    = w.get("mom_1m") or 0
+
+            # Skip if price too low for liquid options
+            if price < 5:
+                continue
+
+            # Count how many short criteria are met
+            criteria_met = []
+            criteria_fail = []
+
+            if score <= 40:
+                criteria_met.append(f"✅ Weak fundamentals (score {score}/100)")
+            else:
+                criteria_fail.append(f"❌ Score {score} not weak enough (need ≤40)")
+
+            if rev_g < -3:
+                criteria_met.append(f"✅ Revenue declining ({rev_g:+.0f}% YoY)")
+            elif rev_g < 0:
+                criteria_met.append(f"🟡 Revenue slightly negative ({rev_g:+.0f}% YoY)")
+            else:
+                criteria_fail.append(f"❌ Revenue not declining ({rev_g:+.0f}%)")
+
+            if rs_iwm <= -8:
+                criteria_met.append(f"✅ Badly lagging IWM ({rs_iwm:+.0f}% RS)")
+            elif rs_iwm <= -4:
+                criteria_met.append(f"🟡 Lagging IWM ({rs_iwm:+.0f}% RS)")
+            else:
+                criteria_fail.append(f"❌ Not lagging IWM enough ({rs_iwm:+.0f}%)")
+
+            if rng <= 25:
+                criteria_met.append(f"✅ Near 52W low ({rng:.0f}% range — established downtrend)")
+            elif rng <= 40:
+                criteria_met.append(f"🟡 In lower half of range ({rng:.0f}%)")
+            else:
+                criteria_fail.append(f"❌ Not near 52W low ({rng:.0f}% — short squeeze risk)")
+
+            if de > 2.0:
+                criteria_met.append(f"✅ High debt ({de:.1f}x D/E — financial stress risk)")
+            elif de > 1.0:
+                criteria_met.append(f"🟡 Elevated debt ({de:.1f}x D/E)")
+
+            if fcf < 0:
+                criteria_met.append(f"✅ Burning cash (FCF negative — needs external funding)")
+
+            # Need at least 3 green criteria to flag as short candidate
+            green_count = sum(1 for c in criteria_met if c.startswith("✅"))
+            if green_count >= 3:
+                # Suggested put strategy
+                if price < 20:
+                    strike    = round(price * 0.90, 0)
+                    spread_w  = 2.50
+                elif price < 50:
+                    strike    = round(price * 0.92, 0)
+                    spread_w  = 5.0
+                elif price < 150:
+                    strike    = round(price * 0.93, 0)
+                    spread_w  = 10.0
+                else:
+                    strike    = round(price * 0.93, 0)
+                    spread_w  = 15.0
+
+                confidence = "🔴 High conviction" if green_count >= 4 else "🟠 Moderate conviction"
+
+                short_candidates.append({
+                    "w":             w,
+                    "criteria_met":  criteria_met,
+                    "criteria_fail": criteria_fail,
+                    "green_count":   green_count,
+                    "confidence":    confidence,
+                    "strike":        strike,
+                    "spread_w":      spread_w,
+                })
+
+        if not short_candidates:
+            st.info(
+                "No Avoid stocks currently meet all short criteria. "
+                "Either the downtrends are not yet established, or the stocks are "
+                "already near 52W lows making squeeze risk too high. "
+                "Check back after a market bounce which may offer better entry points."
+            )
+        else:
+            st.markdown(f"**{len(short_candidates)} short candidate(s) identified:**")
+
+            for sc in short_candidates:
+                w          = sc["w"]
+                ticker     = w["ticker"]
+                name       = w["name"]
+                sector     = w["sector"]
+                price      = w["price"]
+                score      = w["q_score"]
+                confidence = sc["confidence"]
+                strike     = sc["strike"]
+                spread_w   = sc["spread_w"]
+                green      = sc["green_count"]
+                rng        = w.get("range_pct", 50)
+                rs_iwm     = w.get("rs_vs_iwm", 0)
+                rev_g      = w.get("rev_growth", 0)
+
+                with st.expander(
+                    f"{confidence[:2]} {ticker}  —  {name}  —  ${price:.2f}  "
+                    f"|  Score {score}/100  |  {green}/6 criteria met  ▼ expand for analysis",
+                    expanded=False,
+                ):
+                    st.markdown(f"**{confidence}** — {green} of 6 short criteria confirmed")
+                    st.divider()
+
+                    sc1, sc2 = st.columns(2)
+
+                    with sc1:
+                        st.markdown("**✅ Criteria Met (short thesis):**")
+                        for c in sc["criteria_met"]:
+                            st.markdown(c)
+
+                        if sc["criteria_fail"]:
+                            st.markdown("**⚠️ Criteria Not Met (risks):**")
+                            for c in sc["criteria_fail"]:
+                                st.markdown(c)
+
+                    with sc2:
+                        st.markdown("**📉 Suggested Put Strategy:**")
+
+                        # Choose between buying puts or put spread based on IV rank
+                        iv_rank = w.get("iv_rank_proxy") or 50
+                        if iv_rank and iv_rank > 60:
+                            strategy_type = "Bear Put Spread (IV elevated — spread reduces cost)"
+                            buy_put  = strike
+                            sell_put = round(strike - spread_w, 0)
+                            est_cost = round(spread_w * 0.35 * 100, 0)
+                            max_gain = round((spread_w - spread_w * 0.35) * 100, 0)
+                            st.markdown(f"**Strategy:** Buy ${buy_put:.0f} Put / Sell ${sell_put:.0f} Put")
+                            st.markdown(f"**Why spread:** IV rank ~{iv_rank:.0f}% — options are expensive. "
+                                       "Selling the lower put reduces your cost significantly.")
+                        else:
+                            strategy_type = "Buy Put outright (IV reasonable)"
+                            est_cost = round(price * (iv_rank/100) * 0.06 * 100, 0)
+                            est_cost = max(est_cost, 50)
+                            max_gain = round(est_cost * 2.5, 0)
+                            st.markdown(f"**Strategy:** Buy ${strike:.0f} Put")
+                            st.markdown(f"**Why outright:** IV rank ~{iv_rank:.0f}% — "
+                                       "options reasonably priced. No need to sell a spread.")
+
+                        max_risk_gbp = round(est_cost / GBPUSD, 0)
+                        st.markdown(f"**Expiry:** 30-45 DTE (give the thesis time to play out)")
+                        st.markdown(f"**Est. cost:** ~${est_cost:.0f} (~£{max_risk_gbp:.0f})")
+                        st.markdown(f"**Target:** 2-2.5x the premium paid")
+                        st.markdown(f"**Stop:** Exit if stock closes above 20-day MA")
+
+                        st.divider()
+                        st.markdown("**Why this is a short and not just avoid:**")
+                        context_parts = []
+                        if rev_g and rev_g < 0:
+                            context_parts.append(
+                                f"Revenue is actively declining ({rev_g:.0f}% YoY) — "
+                                "this compounds. A shrinking top line usually means "
+                                "margins compress next, then cash burns."
+                            )
+                        if rs_iwm and rs_iwm <= -8:
+                            context_parts.append(
+                                f"Institutional money is already leaving "
+                                f"({rs_iwm:.0f}% behind IWM over 1 month). "
+                                "Smart money exits before retail catches on."
+                            )
+                        if rng and rng <= 25:
+                            context_parts.append(
+                                f"At {rng:.0f}% of its 52W range — the downtrend is established "
+                                "and confirmed. Shorting an established downtrend is much safer "
+                                "than trying to pick a top."
+                            )
+                        for part in context_parts:
+                            st.markdown(f"• {part}")
+
+                        st.markdown(
+                            f"**On IBKR:** Options chain → {ticker} → "
+                            f"select expiry 30-45 days out → {strategy_type}. "
+                            "Check bid/ask spread and open interest (need >100 OI). "
+                            "Use limit order at mid-price."
+                        )
+
         st.divider()
         st.markdown("### 📖 Understanding the Quality Score")
         with st.expander("How the 0-100 score is calculated", expanded=False):
@@ -4113,6 +4359,25 @@ with tab_journal:
                     f"{stats['total']} trades, {wr:.0f}% win rate, "
                     f"P&L: £{pl:,.0f}"
                 )
+
+        # ── Running P&L chart ────────────────────────────────────
+        if closed:
+            st.divider()
+            st.markdown("### 📈 Running P&L")
+            closed_df = pd.DataFrame([t for t in journal if t["Result"] != "Open"])
+            if "P&L £" in closed_df.columns and "Date" in closed_df.columns:
+                closed_df["P&L £"] = pd.to_numeric(closed_df["P&L £"], errors="coerce").fillna(0)
+                closed_df = closed_df.sort_values("Date")
+                closed_df["Cumulative P&L £"] = closed_df["P&L £"].cumsum()
+                fig_pnl = px.line(
+                    closed_df, x="Date", y="Cumulative P&L £",
+                    markers=True,
+                    title="Cumulative P&L (£)",
+                    color_discrete_sequence=["#16a34a"],
+                )
+                fig_pnl.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_pnl.update_layout(height=250)
+                st.plotly_chart(fig_pnl, use_container_width=True)
 
         # ── Export ────────────────────────────────────────────
         st.divider()
