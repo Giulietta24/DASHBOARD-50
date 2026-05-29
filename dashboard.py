@@ -307,30 +307,91 @@ def color_val(val, good_positive=True):
 @st.cache_data(ttl=300)
 def fetch_macro_snapshot():
     """
-    Fetch all macro indicators in one pass.
-    Returns dict of current values and % changes.
+    Fetch all macro indicators using yf.download() — NOT Ticker.info.
+
+    Why the switch:
+      Ticker.info hits Yahoo Finance's quoteSummary endpoint which is
+      heavily rate-limited on Streamlit Cloud's shared IPs.
+      yf.download() uses the chart endpoint — different URL, much more
+      reliable, and batches ALL tickers in a single network call
+      instead of one call per ticker.
+
+    What we get:
+      Close price series for the last month → last row = current price,
+      second-to-last row = previous close for 1D change calculation.
+      All maths done locally from raw OHLCV data.
     """
-    result = {}
-    for name, ticker in MACRO_TICKERS.items():
-        try:
-            t    = yf.Ticker(ticker, session=_yf_session)
-            info = t.info
-            price = (info.get("regularMarketPrice")
-                     or info.get("currentPrice")
-                     or info.get("previousClose"))
-            hist  = t.history(period="1mo")
-            if not hist.empty and price:
-                prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else float(hist["Close"].iloc[-1])
-                chg_1d = round((float(price) - prev_close) / prev_close * 100, 2)
-                start  = float(hist["Close"].iloc[0])
-                chg_1m = round((float(price) - start) / start * 100, 2)
+    all_tickers = list(MACRO_TICKERS.values())
+    name_map    = {v: k for k, v in MACRO_TICKERS.items()}
+    result      = {}
+
+    try:
+        # One batch download — far less likely to be rate-limited
+        raw = yf.download(
+            all_tickers,
+            period="1mo",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            session=_yf_session,
+        )
+        # yf.download returns MultiIndex columns when multiple tickers
+        if isinstance(raw.columns, pd.MultiIndex):
+            closes = raw["Close"]
+        else:
+            closes = raw[["Close"]]
+            closes.columns = all_tickers
+
+        # Strip timezone so comparisons work cleanly
+        if hasattr(closes.index, "tz") and closes.index.tz:
+            closes.index = closes.index.tz_localize(None)
+
+        for yf_ticker, name in name_map.items():
+            if yf_ticker not in closes.columns:
+                continue
+            series = closes[yf_ticker].dropna()
+            if len(series) < 2:
+                continue
+            price      = float(series.iloc[-1])
+            prev_close = float(series.iloc[-2])
+            start      = float(series.iloc[0])
+            chg_1d     = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0
+            chg_1m     = round((price - start)      / start      * 100, 2) if start else 0
+            result[name] = {
+                "price":  round(price, 2),
+                "chg_1d": chg_1d,
+                "chg_1m": chg_1m,
+            }
+
+    except Exception as e:
+        # Last-resort: try each ticker individually
+        for name, ticker in MACRO_TICKERS.items():
+            try:
+                df = yf.download(
+                    ticker, period="5d", interval="1d",
+                    auto_adjust=True, progress=False,
+                    session=_yf_session,
+                )
+                if df.empty:
+                    continue
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                series = df["Close"].dropna()
+                if len(series) < 2:
+                    continue
+                price      = float(series.iloc[-1])
+                prev_close = float(series.iloc[-2])
+                start      = float(series.iloc[0])
+                chg_1d     = round((price - prev_close) / prev_close * 100, 2)
+                chg_1m     = round((price - start)      / start      * 100, 2)
                 result[name] = {
-                    "price": round(float(price), 2),
+                    "price":  round(price, 2),
                     "chg_1d": chg_1d,
                     "chg_1m": chg_1m,
                 }
-        except Exception:
-            pass
+            except Exception:
+                pass
+
     return result
 
 
@@ -1322,242 +1383,83 @@ def calc_relative_strength(stock_tickers, etf_ticker, period="1mo"):
 @st.cache_data(ttl=300)
 def fetch_cross_asset(macro_snapshot):
     """
-    Extracts cross-asset signals from the macro snapshot and
-    computes derived ratios: Silver/Gold, Copper/Gold, REITs vs Bonds.
+    Fetches cross-asset signals: currencies, extra commodities, REITs.
+    Uses yf.download() batch calls — avoids Ticker.info rate limits.
     """
-    def chg(key):   return macro_snapshot.get(key, {}).get("chg_1d")
-    def price(key): return macro_snapshot.get(key, {}).get("price")
-
-    sg_ratio = round(price("Silver") / price("Gold"), 4) if price("Silver") and price("Gold") else None
-    cg_ratio = round(price("Copper") / price("Gold"), 6) if price("Copper") and price("Gold") else None
-
-    vnq_chg = chg("REITs (VNQ)")
-    tlt_chg = chg("TLT")
-    reit_bond_signal = None
-    if vnq_chg is not None and tlt_chg is not None:
-        if vnq_chg > 0.5 and tlt_chg > 0.5:
-            reit_bond_signal = ("🟢 Both rising", "REITs and bonds up — rates falling. Buy calls on VNQ, XLU.")
-        elif vnq_chg < -0.5 and tlt_chg < -0.5:
-            reit_bond_signal = ("🔴 Both falling", "Rates rising aggressively. Avoid real estate and utilities.")
-        elif vnq_chg > 0.5 and tlt_chg < -0.5:
-            reit_bond_signal = ("🟡 Diverging", "REITs rising, bonds still falling — market pricing rate cuts.")
-        else:
-            reit_bond_signal = ("🟡 Mixed", "No strong REIT/Bond signal today.")
-
-    return {
-        "sg_ratio":    sg_ratio,
-        "cg_ratio":    cg_ratio,
-        "reit_bond":   reit_bond_signal,
-        "gbpusd_live": price("GBP/USD"),
-        "silver_chg":  chg("Silver"),
-        "copper_chg":  chg("Copper"),
-        "natgas_chg":  chg("Natural Gas"),
-        "wheat_chg":   chg("Wheat"),
-        "gbpusd_chg":  chg("GBP/USD"),
-        "eurusd_chg":  chg("EUR/USD"),
-        "usdjpy_chg":  chg("USD/JPY"),
-        "audusd_chg":  chg("AUD/USD"),
-        "usdcad_chg":  chg("USD/CAD"),
-        "vnq_chg":     vnq_chg,
-        "eqix_chg":    chg("Data Centre REITs"),
+    CROSS_TICKERS = {
+        "gbpusd":   "GBPUSD=X",
+        "eurusd":   "EURUSD=X",
+        "usdjpy":   "USDJPY=X",
+        "audusd":   "AUDUSD=X",
+        "usdcad":   "USDCAD=X",
+        "copper":   "HG=F",
+        "silver":   "SI=F",
+        "natgas":   "NG=F",
+        "wheat":    "ZW=F",
+        "vnq":      "VNQ",
+        "tlt":      "TLT",
     }
 
+    result = {}
 
-def analyse_scenarios(macro, cross):
-    """
-    Identifies which cross-asset scenarios are active and what
-    trades they suggest. Returns list sorted by confidence.
-    """
-    scenarios = []
+    try:
+        tickers = list(CROSS_TICKERS.values())
+        raw = yf.download(
+            tickers, period="5d", interval="1d",
+            auto_adjust=True, progress=False,
+            session=_yf_session,
+        )
+        if isinstance(raw.columns, pd.MultiIndex):
+            closes = raw["Close"]
+        else:
+            closes = raw[["Close"]]
+            closes.columns = tickers
 
-    def chg(key):   return macro.get(key, {}).get("chg_1d") or 0
-    def price(key): return macro.get(key, {}).get("price") or 0
+        if hasattr(closes.index, "tz") and closes.index.tz:
+            closes.index = closes.index.tz_localize(None)
 
-    vix      = price("VIX")
-    gold_c   = chg("Gold")
-    oil_c    = chg("Crude Oil")
-    dxy_c    = chg("US Dollar (DXY)")
-    spy_c    = chg("SPY")
-    hyg_c    = chg("HYG")
-    tlt_c    = chg("TLT")
-    copper_c = cross.get("copper_chg") or 0
-    silver_c = cross.get("silver_chg") or 0
-    audusd_c = cross.get("audusd_chg") or 0
-    usdjpy_c = cross.get("usdjpy_chg") or 0
-    gbpusd_c = cross.get("gbpusd_chg") or 0
-    eurusd_c = cross.get("eurusd_chg") or 0
-    vnq_c    = cross.get("vnq_chg") or 0
-    usdcad_c = cross.get("usdcad_chg") or 0
-    natgas_c = cross.get("natgas_chg") or 0
-    wheat_c  = cross.get("wheat_chg") or 0
+        for key, yf_t in CROSS_TICKERS.items():
+            if yf_t not in closes.columns:
+                continue
+            series = closes[yf_t].dropna()
+            if len(series) < 2:
+                continue
+            price  = float(series.iloc[-1])
+            prev   = float(series.iloc[-2])
+            chg    = round((price - prev) / prev * 100, 2) if prev else 0
+            result[f"{key}_live"]  = round(price, 4)
+            result[f"{key}_chg"]   = chg
 
-    # ── SCENARIO 1: Global Growth Accelerating ────────────────
-    s1 = []
-    if copper_c >= 1.0:             s1.append(f"Copper +{copper_c:.1f}% — industrial demand rising")
-    if audusd_c >= 0.5:             s1.append(f"AUD/USD +{audusd_c:.1f}% — China/commodity demand")
-    if silver_c > gold_c + 0.5:     s1.append(f"Silver outperforming gold — industrial > fear")
-    if spy_c >= 0.5 and hyg_c >= 0: s1.append(f"Equities up + credit healthy — broad participation")
-    if s1:
-        scenarios.append({
-            "name": "🌱 Global Growth Accelerating",
-            "confidence": len(s1), "signals": s1,
-            "what": (
-                "Copper and AUD/USD are the world's best economic growth barometers — "
-                "they move 4-6 weeks before GDP data confirms it. "
-                "Silver outperforming gold confirms demand is industrial not fear-driven. "
-                "This is an early signal to rotate into cyclicals before the crowd notices."
-            ),
-            "buy_calls":  ["XLB (materials)", "XLI (industrials)", "GDX (gold miners)",
-                           "EEM (emerging markets)", "KWEB (China)", "CAT", "RIO", "MP Materials"],
-            "buy_puts":   ["TLT (bonds sell off as growth picks up)", "XLU (utilities rotate out)"],
-            "income":     ["Sell puts below 50MA on XLB, XLI — premium elevated, trend supports"],
-            "avoid":      ["Defensive sectors XLP, XLU, XLV", "Long bonds TLT"],
-            "gbp_note":   f"GBP/USD {gbpusd_c:+.2f}% — " + (
-                "strengthening GBP means US profits buy more pounds. Good environment for your capital."
-                if gbpusd_c >= 0 else
-                "weakening GBP reduces UK value of US profits. Consider sizing down slightly."
-            ),
-        })
+    except Exception:
+        pass
 
-    # ── SCENARIO 2: Risk-Off / Yen Carry Unwind ───────────────
-    s2 = []
-    if usdjpy_c <= -0.8: s2.append(f"USD/JPY -{abs(usdjpy_c):.1f}% — yen strengthening, carry unwind")
-    if gold_c >= 1.0:    s2.append(f"Gold +{gold_c:.1f}% — safe-haven flight")
-    if hyg_c <= -0.5:    s2.append(f"HYG -{abs(hyg_c):.1f}% — credit stress")
-    if spy_c <= -1.0:    s2.append(f"SPY -{abs(spy_c):.1f}% — equities selling off")
-    if vix >= 20 and chg("VIX") >= 5: s2.append(f"VIX spiking +{chg('VIX'):.1f}%")
-    if s2:
-        scenarios.append({
-            "name": "🌀 Risk-Off / Yen Carry Unwind",
-            "confidence": len(s2), "signals": s2,
-            "what": (
-                "The yen carry trade: borrow cheap yen, buy higher-yielding assets. "
-                "When the yen strengthens (USD/JPY falls), traders must unwind — "
-                "selling assets globally to repay yen loans. "
-                "This creates sudden sharp sell-offs in equities, crypto, and EM. "
-                "HYG falling confirms it's credit stress not just equity weakness."
-            ),
-            "buy_calls":  ["GLD (gold)", "TLT (flight to safety)", "XLP (defensive staples)", "XLV (defensive health)"],
-            "buy_puts":   ["QQQ", "SMH", "EEM", "KWEB", "XLY — all hit hardest in carry unwind"],
-            "income":     ["Sell call spreads above resistance on QQQ — elevated IV, capped upside"],
-            "avoid":      ["Buying calls on any growth/cyclical", "Naked puts — gaps possible"],
-            "gbp_note":   "GBP typically weakens vs USD in risk-off. Your put profits in USD buy more GBP if GBP falls — natural partial hedge.",
-        })
+    # Derived ratios from fetched prices
+    gold_p   = macro_snapshot.get("Gold",      {}).get("price") or 1
+    silver_p = result.get("silver_live") or 0
+    copper_p = result.get("copper_live") or 0
+    vnq_chg  = result.get("vnq_chg")    or 0
+    tlt_chg  = result.get("tlt_live")   or 0
 
-    # ── SCENARIO 3: Stagflation ───────────────────────────────
-    s3 = []
-    if oil_c >= 2.0:   s3.append(f"Oil +{oil_c:.1f}% — energy inflation")
-    if dxy_c >= 0.5:   s3.append(f"Dollar +{dxy_c:.1f}% — tightening conditions")
-    if gold_c >= 0.8:  s3.append(f"Gold +{gold_c:.1f}% — inflation hedge demand")
-    if wheat_c >= 2.0: s3.append(f"Wheat +{wheat_c:.1f}% — food price inflation")
-    if natgas_c >= 3:  s3.append(f"Nat gas +{natgas_c:.1f}% — energy cost surge")
-    if spy_c <= 0:     s3.append("Equities flat/falling despite energy surge")
-    if len(s3) >= 3:
-        scenarios.append({
-            "name": "🔥 Stagflation — Inflation Without Growth",
-            "confidence": len(s3), "signals": s3,
-            "what": (
-                "Rising prices (oil, gas, food) with stagnant or falling growth. "
-                "The worst environment for most portfolios. "
-                "Growth stocks suffer — rates must stay high to fight inflation. "
-                "Consumer discretionary suffers — less disposable income. "
-                "Energy and commodity producers are the only winners — "
-                "they're selling the thing that's expensive."
-            ),
-            "buy_calls":  ["XLE (energy)", "XOP (oil exploration)", "OIH (oil services)", "GLD", "XLB"],
-            "buy_puts":   ["QQQ (growth crushed)", "XLY (consumer squeezed)", "ITB (homebuilders)"],
-            "income":     ["Sell puts on XLE below support — collect energy premium",
-                           "Sell call spreads on QQQ — capped upside in stagflation"],
-            "avoid":      ["ARKK, high-multiple tech", "REITs (rate headwind)", "XLY"],
-            "gbp_note":   (
-                "Oil priced in USD. Rising oil + strong dollar = double cost pressure for UK. "
-                f"GBP/USD {gbpusd_c:+.2f}% — UK capital buys fewer USD today."
-            ),
-        })
+    result["silver_gold_ratio"] = round(silver_p / gold_p, 4)   if gold_p else None
+    result["copper_gold_ratio"] = round(copper_p / gold_p, 4)   if gold_p else None
 
-    # ── SCENARIO 4: Dollar Surge ──────────────────────────────
-    s4 = []
-    if dxy_c >= 0.8:   s4.append(f"DXY +{dxy_c:.1f}% — dollar surging")
-    if audusd_c <= -0.5: s4.append(f"AUD/USD -{abs(audusd_c):.1f}% — commodity currencies falling")
-    if eurusd_c <= -0.5: s4.append(f"EUR/USD -{abs(eurusd_c):.1f}% — European weakness")
-    if copper_c <= -0.5: s4.append(f"Copper -{abs(copper_c):.1f}% — global demand concerns")
-    if usdcad_c >= 0.5:  s4.append(f"USD/CAD +{usdcad_c:.1f}% — oil/CAD under pressure")
-    if len(s4) >= 2:
-        scenarios.append({
-            "name": "💵 Dollar Surge",
-            "confidence": len(s4), "signals": s4,
-            "what": (
-                "Rising dollar = headwind for almost everything priced in USD. "
-                "Commodities more expensive for foreign buyers (demand falls). "
-                "US multinationals see overseas earnings worth less when converted. "
-                "EM countries with USD debt face financing crises. "
-                "Dollar surges when US rates are high vs other countries, or in risk-off."
-            ),
-            "buy_calls":  ["Domestic US companies (XLP, XLV)", "UUP (direct dollar exposure)"],
-            "buy_puts":   ["GLD", "GDX", "EEM", "KWEB", "XLE if oil falls"],
-            "income":     ["Sell puts on domestic US large caps — stable during dollar surge"],
-            "avoid":      ["GDX, SIL, XOP", "EEM, KWEB, FXI", "AAPL/MSFT — high FX exposure"],
-            "gbp_note":   (
-                f"GBP/USD {gbpusd_c:+.2f}% — dollar surge means your £35K buys fewer USD contracts. "
-                "Effective sizing constraint — reduce notional exposure or wait for stabilisation."
-            ),
-        })
+    # REIT vs Bond signal
+    if vnq_chg and tlt_chg:
+        spread = round(vnq_chg - tlt_chg, 2)
+        if spread >= 0.5:
+            result["reit_bond_signal"] = "🟢 REITs outperforming bonds — rate peak signal"
+        elif spread <= -0.5:
+            result["reit_bond_signal"] = "🔴 Bonds outperforming REITs — rates still rising"
+        else:
+            result["reit_bond_signal"] = "🟡 Mixed"
+    else:
+        result["reit_bond_signal"] = "🟡 Mixed"
 
-    # ── SCENARIO 5: Rate Cut Expectation ─────────────────────
-    s5 = []
-    if tlt_c >= 0.8:    s5.append(f"TLT +{tlt_c:.1f}% — bonds rallying, rates falling")
-    if vnq_c >= 0.8:    s5.append(f"REITs +{vnq_c:.1f}% — rate-sensitive sectors recovering")
-    if usdjpy_c <= -0.5: s5.append(f"USD/JPY -{abs(usdjpy_c):.1f}% — rate differential narrowing")
-    if dxy_c <= -0.3:   s5.append(f"Dollar -{abs(dxy_c):.1f}% — weaker USD on rate cut bets")
-    if chg("2Y Treasury") <= -0.05: s5.append("2Y yields falling — Fed cut priced in")
-    if len(s5) >= 2:
-        scenarios.append({
-            "name": "📉 Rate Cut Expectation Building",
-            "confidence": len(s5), "signals": s5,
-            "what": (
-                "Bond markets pricing in future rate cuts. "
-                "Lower rates are good for: growth stocks (future earnings worth more), "
-                "REITs (cheaper financing, better yield spread), "
-                "small caps (floating-rate debt relief), EM (USD weakens). "
-                "One of the strongest tailwinds for growth plays."
-            ),
-            "buy_calls":  ["QQQ", "XLK", "VNQ (REITs re-rate)", "XLU", "IWM (small cap relief)", "ARKK"],
-            "buy_puts":   ["UUP (dollar weakens)", "GLD may dip if risk-on rotation"],
-            "income":     ["Sell puts on QQQ, XLK below support — rising tide gives buffer"],
-            "avoid":      ["Short bonds (TLT puts) — fighting the trend"],
-            "gbp_note":   (
-                f"Rate cuts weaken USD vs GBP. GBP/USD {gbpusd_c:+.2f}% today. "
-                "Stronger pound means US profits buy more in UK — but US contracts cost more in GBP."
-            ),
-        })
+    # GBP/USD live rate for sizing
+    if result.get("gbpusd_live"):
+        result["gbpusd_live"] = result["gbpusd_live"]
 
-    # ── SCENARIO 6: GBP Alert ────────────────────────────────
-    if abs(gbpusd_c) >= 0.8:
-        direction = "rising" if gbpusd_c > 0 else "falling"
-        scenarios.append({
-            "name": f"💷 GBP/USD Alert — {direction.title()}",
-            "confidence": 2 if abs(gbpusd_c) >= 1.5 else 1,
-            "signals": [f"GBP/USD {gbpusd_c:+.2f}% — significant move affecting your P&L"],
-            "what": (
-                f"GBP is {direction} significantly vs USD today. "
-                + ("Stronger GBP: US profits buy more pounds on repatriation. "
-                   "Consider sizing up slightly — your effective buying power is higher."
-                   if gbpusd_c > 0 else
-                   "Weaker GBP: US profits buy fewer pounds on repatriation. "
-                   "Your £35K buys fewer USD options contracts today. Size down or wait.")
-            ),
-            "buy_calls":  (["UK ADRs: AZN, GSK, BP, SHEL — strong GBP helps UK earnings"] if gbpusd_c > 0 else
-                           ["USD-denominated assets — profits worth more in GBP when converted"]),
-            "buy_puts":   [],
-            "income":     ["GBP vol = income opportunity — elevated currency vol can be harvested"],
-            "avoid":      (["Oversizing when GBP weak — capital constraint"] if gbpusd_c < 0 else []),
-            "gbp_note":   f"Live rate: {cross.get('gbpusd_live', GBPUSD):.4f} GBP/USD",
-        })
-
-    scenarios.sort(key=lambda x: x["confidence"], reverse=True)
-    return scenarios
-
-
+    return result
 @st.cache_data(ttl=300)   # 5-min cache — VWAP is intraday, needs to be fresh
 def fetch_vwap(tickers):
     """
@@ -2605,7 +2507,19 @@ with tab_ideas:
 
 with tab_macro:
     st.subheader("🌍 Macro Dashboard")
-    st.caption("The macro regime drives everything else. Read this to calibrate your Trade Ideas.")
+
+    # Refresh controls
+    mh1, mh2 = st.columns([4, 1])
+    with mh1:
+        st.caption(
+            "The macro regime drives everything else. "
+            "Read this to calibrate your Trade Ideas. "
+            "Data refreshes every 5 minutes automatically."
+        )
+    with mh2:
+        if st.button("🔄 Refresh Now", key="macro_refresh"):
+            st.cache_data.clear()
+            st.rerun()
 
     # Key metric tiles
     tile_cols = st.columns(6)
