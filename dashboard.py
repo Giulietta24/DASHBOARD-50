@@ -1989,6 +1989,157 @@ def journal_delete_all():
     st.session_state["journal"] = []
     st.session_state.pop("journal_loaded_from_db", None)
 
+
+def analyse_scenarios(macro, cross):
+    """
+    Detects active market scenarios from cross-asset signals.
+    Returns list of scenario dicts. Each scenario has:
+      name, confidence, signals, calls, puts, avoid, note
+    """
+    scenarios  = []
+
+    # Extract values with safe defaults using new key naming
+    copper_c = cross.get("copper_chg")  or 0
+    silver_c = cross.get("silver_chg")  or 0
+    audusd_c = cross.get("audusd_chg")  or 0
+    usdjpy_c = cross.get("usdjpy_chg")  or 0
+    gbpusd_c = cross.get("gbpusd_chg")  or 0
+    eurusd_c = cross.get("eurusd_chg")  or 0
+    usdcad_c = cross.get("usdcad_chg")  or 0
+    natgas_c = cross.get("natgas_chg")  or 0
+    wheat_c  = cross.get("wheat_chg")   or 0
+    vnq_c    = cross.get("vnq_chg")     or 0
+
+    gold_chg = macro.get("Gold",      {}).get("chg_1d") or 0
+    oil_chg  = macro.get("Crude Oil", {}).get("chg_1d") or 0
+    dxy_chg  = macro.get("US Dollar (DXY)", {}).get("chg_1d") or 0
+    hyg_chg  = macro.get("HYG",       {}).get("chg_1d") or 0
+    spy_chg  = macro.get("SPY",       {}).get("chg_1d") or 0
+    tlt_chg  = macro.get("TLT",       {}).get("chg_1d") or 0
+    y2_chg   = macro.get("2Y Treasury", {}).get("chg_1d") or 0
+
+    # ── Scenario 1: Global Growth Accelerating ────────────────
+    s1_sigs = []
+    if copper_c >= 0.5:  s1_sigs.append(f"Copper +{copper_c:.1f}% (industrial demand)")
+    if audusd_c >= 0.3:  s1_sigs.append(f"AUD/USD +{audusd_c:.1f}% (China/commodity proxy)")
+    if silver_c > gold_chg + 0.2: s1_sigs.append("Silver outperforming Gold (industrial > fear)")
+    if hyg_chg >= 0.3:   s1_sigs.append(f"HYG +{hyg_chg:.1f}% (credit healthy)")
+    if spy_chg >= 0.5:   s1_sigs.append(f"SPY +{spy_chg:.1f}%")
+    if len(s1_sigs) >= 2:
+        scenarios.append({
+            "name":       "🌱 Global Growth Accelerating",
+            "confidence": len(s1_sigs),
+            "signals":    s1_sigs,
+            "calls":      ["XLB (materials)", "XLI (industrials)", "GDX (gold miners)", "EEM (emerging)", "XLE (energy)"],
+            "puts":       [],
+            "avoid":      ["TLT (bonds)", "XLU (utilities)"],
+            "note":       "Copper leading = growth beating fear. Cyclicals and commodities benefit. "
+                         "Buy calls on sector leaders from ETF Screener.",
+        })
+
+    # ── Scenario 2: Risk-Off / Yen Carry Unwind ───────────────
+    s2_sigs = []
+    if usdjpy_c <= -0.5: s2_sigs.append(f"USD/JPY {usdjpy_c:.1f}% (yen strengthening — carry unwind)")
+    if gold_chg >= 0.5:  s2_sigs.append(f"Gold +{gold_chg:.1f}% (safe-haven demand)")
+    if hyg_chg <= -0.5:  s2_sigs.append(f"HYG {hyg_chg:.1f}% (credit stress)")
+    if spy_chg <= -0.5:  s2_sigs.append(f"SPY {spy_chg:.1f}%")
+    if tlt_chg >= 0.5:   s2_sigs.append(f"TLT +{tlt_chg:.1f}% (flight to bonds)")
+    if len(s2_sigs) >= 2:
+        scenarios.append({
+            "name":       "🌀 Risk-Off / Yen Carry Unwind",
+            "confidence": len(s2_sigs),
+            "signals":    s2_sigs,
+            "calls":      ["GLD (gold)", "TLT (bonds)", "XLU (utilities)", "XLP (staples)"],
+            "puts":       ["QQQ", "SMH (semis)", "EEM (emerging)", "XLY (discretionary)"],
+            "avoid":      ["Naked calls on growth stocks"],
+            "note":       "Yen carry unwind = forced deleveraging. Volatility spikes. "
+                         "Buy puts on growth, buy GLD. Income plays: sell call spreads above resistance.",
+        })
+
+    # ── Scenario 3: Stagflation ───────────────────────────────
+    s3_sigs = []
+    if oil_chg >= 2:     s3_sigs.append(f"Oil +{oil_chg:.1f}% (energy cost surge)")
+    if natgas_c >= 2:    s3_sigs.append(f"Nat Gas +{natgas_c:.1f}%")
+    if wheat_c >= 1.5:   s3_sigs.append(f"Wheat +{wheat_c:.1f}% (food inflation)")
+    if dxy_chg >= 0.5:   s3_sigs.append(f"Dollar +{dxy_chg:.1f}% (tightening conditions)")
+    if spy_chg <= 0:     s3_sigs.append("Equities flat/negative despite commodity surge")
+    if len(s3_sigs) >= 2:
+        scenarios.append({
+            "name":       "🔥 Stagflation Risk",
+            "confidence": len(s3_sigs),
+            "signals":    s3_sigs,
+            "calls":      ["XLE (energy)", "XOP (oil & gas)", "GLD (gold)", "XLB (materials)"],
+            "puts":       ["QQQ (growth)", "XLY (discretionary)", "ITB (homebuilders)"],
+            "avoid":      ["Long-duration bonds (TLT)", "High-PE growth stocks"],
+            "note":       "Rising costs + weak growth = worst of both worlds. "
+                         "Energy and commodities are the only reliable longs. "
+                         "Avoid consumer discretionary — margins get squeezed from both sides.",
+        })
+
+    # ── Scenario 4: Dollar Surge ──────────────────────────────
+    s4_sigs = []
+    if dxy_chg >= 0.5:   s4_sigs.append(f"Dollar +{dxy_chg:.1f}%")
+    if audusd_c <= -0.3: s4_sigs.append(f"AUD/USD {audusd_c:.1f}% (commodity pressure)")
+    if eurusd_c <= -0.3: s4_sigs.append(f"EUR/USD {eurusd_c:.1f}%")
+    if gold_chg <= -0.3: s4_sigs.append(f"Gold {gold_chg:.1f}% (USD-priced commodities falling)")
+    if copper_c <= -0.5: s4_sigs.append(f"Copper {copper_c:.1f}%")
+    if len(s4_sigs) >= 2:
+        scenarios.append({
+            "name":       "💵 Dollar Surge",
+            "confidence": len(s4_sigs),
+            "signals":    s4_sigs,
+            "calls":      ["XLP (domestic staples)", "XLV (healthcare)", "XLF (financials)"],
+            "puts":       ["GLD (gold)", "EEM (emerging)", "KWEB (China)", "XLE (energy)"],
+            "avoid":      ["US multinationals with overseas revenue"],
+            "note":       f"Strong dollar = headwind for commodities and your GBP capital. "
+                         f"GBP/USD {gbpusd_c:+.2f}% today — your US profits buy "
+                         f"{'fewer' if gbpusd_c < 0 else 'more'} pounds right now.",
+        })
+
+    # ── Scenario 5: Rate Cut Expectations ────────────────────
+    s5_sigs = []
+    if tlt_chg >= 0.5:   s5_sigs.append(f"TLT +{tlt_chg:.1f}% (bonds rallying = rates falling)")
+    if y2_chg <= -0.05:  s5_sigs.append(f"2Y yield falling {y2_chg:+.2f}% (Fed cut bets)")
+    if vnq_c >= 0.5:     s5_sigs.append(f"REITs +{vnq_c:.1f}% (rate-sensitive sectors recovering)")
+    if hyg_chg >= 0.3:   s5_sigs.append(f"HYG +{hyg_chg:.1f}% (credit loosening)")
+    if len(s5_sigs) >= 2:
+        scenarios.append({
+            "name":       "📉 Rate Cut Expectations",
+            "confidence": len(s5_sigs),
+            "signals":    s5_sigs,
+            "calls":      ["QQQ", "XLK (tech)", "VNQ (REITs)", "IWM (small caps)", "ARKK"],
+            "puts":       [],
+            "avoid":      ["Short bonds"],
+            "note":       "Falling rates benefit long-duration assets. Tech and growth stocks "
+                         "get re-rated higher. REITs become attractive yield plays again. "
+                         "Small caps particularly benefit — they carry more floating-rate debt.",
+        })
+
+    # ── Scenario 6: GBP Alert ─────────────────────────────────
+    if abs(gbpusd_c) >= 0.5:
+        direction = "rising" if gbpusd_c > 0 else "falling"
+        gbp_live  = cross.get("gbpusd_live", 1.27)
+        scenarios.append({
+            "name":       f"💷 GBP/USD Alert ({gbpusd_c:+.2f}% today)",
+            "confidence": 1,
+            "signals":    [f"GBP/USD {gbpusd_c:+.2f}% — significant move for your capital"],
+            "calls":      [],
+            "puts":       [],
+            "avoid":      [],
+            "note":       (
+                f"GBP is {direction} vs USD. Live rate: {gbp_live:.4f}.  "
+                f"Your £35,000 = ~${35000 * gbp_live:,.0f} USD today.  "
+                + ("GBP strengthening = your US options profits buy more pounds when you convert back. "
+                   "No action needed." if gbpusd_c > 0 else
+                   "GBP weakening = your US profits buy fewer pounds. Consider this in position sizing. "
+                   "A 1% GBP move changes your effective return by ~1%.")
+            ),
+        })
+
+    # Sort by confidence descending
+    scenarios.sort(key=lambda x: x["confidence"], reverse=True)
+    return scenarios
+
 # ============================================================
 # UI HELPERS
 # ============================================================
@@ -2688,7 +2839,7 @@ with tab_macro:
     st.markdown("**Derived Ratios**")
     r1, r2, r3 = st.columns(3)
     with r1:
-        sg = cross.get("sg_ratio")
+        sg = cross.get("silver_gold_ratio")
         if sg:
             st.metric("Silver/Gold Ratio", f"{sg:.4f}",
                       help="Rising = industrial demand > fear. Good for cyclicals, materials.")
@@ -2697,12 +2848,12 @@ with tab_macro:
             elif cross.get("silver_chg",0) < (macro.get("Gold",{}).get("chg_1d",0) or 0) - 0.5:
                 st.warning("🔴 Gold outperforming Silver — fear > growth")
     with r2:
-        cg = cross.get("cg_ratio")
+        cg = cross.get("copper_gold_ratio")
         if cg:
             st.metric("Copper/Gold Ratio", f"{cg:.5f}",
                       help="Rising = growth beating fear. Falling = fear dominating. Best single cross-asset signal.")
     with r3:
-        rb = cross.get("reit_bond")
+        rb = cross.get("reit_bond_signal")
         if rb:
             st.metric("REIT vs Bond Signal", rb[0])
             st.caption(rb[1])
