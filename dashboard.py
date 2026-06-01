@@ -2877,41 +2877,52 @@ with tab_macro:
     else:
         conf_labels = {1: "🟡 Emerging", 2: "🟠 Developing", 3: "🟢 Confirmed", 4: "🟢 Strong", 5: "🔴 Dominant"}
         for sc in scenarios:
-            conf    = sc["confidence"]
+            conf     = sc["confidence"]
             conf_lbl = conf_labels.get(conf, f"⚡ {conf} signals")
             with st.expander(
                 f"{sc['name']}  —  {conf_lbl} ({conf} signal{'s' if conf > 1 else ''} confirming)  ▼",
                 expanded=(conf >= 3)
             ):
-                # What's happening
-                st.markdown(f"**What's happening:** {sc['what']}")
-                st.markdown("**Confirming signals:**")
-                for sig in sc["signals"]:
-                    st.markdown(f"  • {sig}")
+                # What's happening — key is "note" in new function
+                note = sc.get("note") or sc.get("what", "")
+                st.markdown(f"**What's happening:** {note}")
+
+                if sc.get("signals"):
+                    st.markdown("**Confirming signals:**")
+                    for sig in sc["signals"]:
+                        st.markdown(f"  • {sig}")
 
                 st.divider()
                 tc1, tc2 = st.columns(2)
                 with tc1:
-                    if sc.get("buy_calls"):
+                    # "calls" key in new function (was "buy_calls")
+                    call_list = sc.get("calls") or sc.get("buy_calls") or []
+                    if call_list:
                         st.markdown("**📈 Buy Calls on:**")
-                        for item in sc["buy_calls"]:
+                        for item in call_list:
                             st.markdown(f"  • {item}")
-                    if sc.get("income"):
+                    income_list = sc.get("income") or []
+                    if income_list:
                         st.markdown("**💰 Income Plays:**")
-                        for item in sc["income"]:
+                        for item in income_list:
                             st.markdown(f"  • {item}")
                 with tc2:
-                    if sc.get("buy_puts"):
+                    # "puts" key in new function (was "buy_puts")
+                    put_list = sc.get("puts") or sc.get("buy_puts") or []
+                    if put_list:
                         st.markdown("**📉 Buy Puts on:**")
-                        for item in sc["buy_puts"]:
+                        for item in put_list:
                             st.markdown(f"  • {item}")
-                    if sc.get("avoid"):
+                    avoid_list = sc.get("avoid") or []
+                    if avoid_list:
                         st.markdown("**⛔ Avoid:**")
-                        for item in sc["avoid"]:
+                        for item in avoid_list:
                             st.markdown(f"  • {item}")
 
-                if sc.get("gbp_note"):
-                    st.info(f"💷 **GBP note:** {sc['gbp_note']}")
+                # GBP note — now embedded in "note" field for GBP scenario
+                gbp_note = sc.get("gbp_note") or ""
+                if gbp_note:
+                    st.info(f"💷 **GBP note:** {gbp_note}")
 
     st.divider()
 
