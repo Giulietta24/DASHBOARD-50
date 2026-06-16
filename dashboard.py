@@ -404,8 +404,9 @@ def detect_regime_quick(macro):
     risk_off = 0
     risk_on  = 0
 
-    vix = macro.get("VIX", {}).get("price")
+    vix     = macro.get("VIX", {}).get("price")
     vix_chg = macro.get("VIX", {}).get("chg_1d")
+    vix_str = f"VIX {vix:.0f}" if vix else "VIX N/A"
     gold_chg = macro.get("Gold", {}).get("chg_1d")
     hyg_chg  = macro.get("HYG", {}).get("chg_1d")
     spy_chg  = macro.get("SPY", {}).get("chg_1d")
@@ -447,8 +448,9 @@ def detect_regime_quick(macro):
                 "puts")
 
     if risk_off >= 5:
+        vix_str = f"{vix:.0f}" if vix else "N/A"
         return ("🔴 Risk-Off", "#dc2626",
-                f"VIX {vix:.0f} — fear dominant. HYG falling. Focus on puts and selling premium.",
+                f"VIX {vix_str} — fear dominant. HYG falling. Focus on puts and selling premium.",
                 "puts")
 
     if risk_off >= 3:
@@ -457,8 +459,9 @@ def detect_regime_quick(macro):
                 "reduce")
 
     if risk_on >= 4:
+        vix_str = f"{vix:.0f}" if vix else "N/A"
         return ("🟢 Risk-On", "#16a34a",
-                f"VIX {vix:.0f} — low fear, credit healthy. Favour calls on leading sectors.",
+                f"VIX {vix_str} — low fear, credit healthy. Favour calls on leading sectors.",
                 "calls")
 
     if risk_on >= 2:
@@ -474,48 +477,108 @@ def detect_regime_quick(macro):
 @st.cache_data(ttl=300)
 def fetch_stock_data(ticker):
     """
-    Fetch everything needed to evaluate a trade idea for one stock:
-    price, IV, HV30, earnings, momentum, 52W range.
+    Fetch everything needed for a trade idea.
+
+    Uses yf.download() for all price/historical data — avoids the
+    heavily rate-limited Ticker.info endpoint on Streamlit Cloud.
+
+    Data sources:
+      yf.download(1y daily)  → price, 52W range, HV30, RSI, MA50,
+                                ATR, momentum, range-bound flag
+      Ticker.options         → IV, options volume, P/C ratio
+                               (different endpoint, less blocked)
+      Ticker.calendar        → earnings date
+                               (different endpoint to Ticker.info)
     """
     try:
-        t    = yf.Ticker(ticker, session=_yf_session)
-        info = t.info
-        price = safe_float(
-            info.get("regularMarketPrice") or info.get("currentPrice")
+        # ── Step 1: All historical data via yf.download() ─────
+        raw = yf.download(
+            ticker, period="1y", interval="1d",
+            auto_adjust=True, progress=False,
+            session=_yf_session,
         )
-        if not price:
+        if raw.empty:
             return None
 
-        low52  = safe_float(info.get("fiftyTwoWeekLow",  0))
-        high52 = safe_float(info.get("fiftyTwoWeekHigh", 0))
-        range_pct = (
-            round((price - low52) / (high52 - low52) * 100, 1)
-            if high52 and high52 != low52 else None
-        )
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
 
-        # Historical volatility (30-day annualised)
-        hist = t.history(period="3mo", auto_adjust=True)
+        if hasattr(raw.index, "tz") and raw.index.tz:
+            raw.index = raw.index.tz_localize(None)
+
+        closes = raw["Close"].dropna()
+        highs  = raw["High"].dropna()
+        lows   = raw["Low"].dropna()
+
+        if len(closes) < 20:
+            return None
+
+        price = float(closes.iloc[-1])
+        if not price or price <= 0:
+            return None
+
+        # 52W range
+        low52  = float(lows.min())
+        high52 = float(highs.max())
+        range_pct = round((price - low52) / (high52 - low52) * 100, 1) if high52 != low52 else None
+
+        # HV30 (30-day annualised historical vol)
         hv30 = None
-        if len(hist) >= 30:
-            lr   = np.log(hist["Close"] / hist["Close"].shift(1)).dropna()
+        if len(closes) >= 31:
+            lr   = np.log(closes / closes.shift(1)).dropna()
             hv30 = round(float(lr.tail(30).std() * np.sqrt(252) * 100), 1)
 
         # 1-month momentum
         mom_1m = None
-        if len(hist) >= 21:
-            mom_1m = round(
-                (float(hist["Close"].iloc[-1]) - float(hist["Close"].iloc[-21]))
-                / float(hist["Close"].iloc[-21]) * 100, 1
-            )
+        if len(closes) >= 21:
+            mom_1m = round((price - float(closes.iloc[-21])) / float(closes.iloc[-21]) * 100, 1)
 
-        # IV from nearest ATM option
-        iv = None
+        # RSI (14-day)
+        rsi = None
+        try:
+            delta = closes.diff()
+            gain  = delta.clip(lower=0).rolling(14).mean()
+            loss  = (-delta.clip(upper=0)).rolling(14).mean()
+            rs    = gain / loss
+            rsi   = round(float(100 - (100 / (1 + rs)).iloc[-1]), 1)
+        except Exception:
+            pass
+
+        # MA50 distance
+        pct_above_ma50 = None
+        try:
+            ma50 = float(closes.rolling(50).mean().iloc[-1])
+            pct_above_ma50 = round((price - ma50) / ma50 * 100, 1)
+        except Exception:
+            pass
+
+        # ATR (14-day)
+        atr = None
+        is_range_bound = False
+        try:
+            close_prev = closes.shift(1)
+            tr = pd.concat([
+                highs - lows,
+                (highs - close_prev).abs(),
+                (lows  - close_prev).abs()
+            ], axis=1).max(axis=1)
+            atr = round(float(tr.rolling(14).mean().iloc[-1]), 2)
+            if len(tr) >= 30:
+                atr_30     = float(tr.rolling(30).mean().iloc[-1])
+                is_range_bound = atr < atr_30 * 0.85
+        except Exception:
+            pass
+
+        # ── Step 2: IV and options data ───────────────────────
+        # Ticker.options uses a different Yahoo endpoint — less blocked
+        iv          = None
         options_vol = None
         pc_ratio    = None
         try:
-            dates = t.options
+            t_obj = yf.Ticker(ticker, session=_yf_session)
+            dates = t_obj.options
             if dates:
-                chain = t.option_chain(dates[0])
+                chain = t_obj.option_chain(dates[0])
                 calls = chain.calls
                 puts  = chain.puts
                 atm   = calls.iloc[(calls["strike"] - price).abs().argsort()[:1]]
@@ -529,146 +592,80 @@ def fetch_stock_data(ticker):
         except Exception:
             pass
 
-        # ── True IV Rank (52-week percentile) ───────────────────
-        # IV rank answers: "Is IV expensive or cheap RIGHT NOW
-        # compared to how expensive it has been over the past year?"
-        #
-        # Method: sample weekly ATM IV over the past 52 weeks by
-        # downloading weekly options chains and recording ATM IV.
-        # Then calculate where today's IV sits in that distribution.
-        #
-        # Because fetching 52 weekly chains is slow, we approximate
-        # using the stock's weekly close-to-close volatility over 52W
-        # to build a realised vol distribution, then compare current IV.
-        # This gives a much better rank than IV/HV alone.
-        iv_rank = None
+        # ── Step 3: IV rank from weekly vol distribution ──────
+        iv_rank      = None
         iv_pct_label = "N/A"
         try:
-            hist_1y = t.history(period="1y", auto_adjust=True)
-            if len(hist_1y) >= 50 and iv:
-                # Weekly realised vol samples (proxy for weekly IV history)
-                weekly = hist_1y["Close"].resample("W").last().dropna()
+            if iv and len(closes) >= 50:
+                weekly   = closes.resample("W").last().dropna()
                 log_rets = np.log(weekly / weekly.shift(1)).dropna()
-
-                # Annualised vol for each rolling 4-week window
-                vol_samples = []
-                for i in range(4, len(log_rets) + 1):
-                    window_vol = float(log_rets.iloc[max(0,i-4):i].std() * np.sqrt(52) * 100)
-                    vol_samples.append(window_vol)
-
+                vol_samples = [
+                    float(log_rets.iloc[max(0,i-4):i].std() * np.sqrt(52) * 100)
+                    for i in range(4, len(log_rets) + 1)
+                ]
                 if vol_samples:
                     vol_min = min(vol_samples)
                     vol_max = max(vol_samples)
                     if vol_max > vol_min:
-                        # Where does current IV sit in the 52W vol range?
                         iv_rank = round((iv - vol_min) / (vol_max - vol_min) * 100, 0)
                         iv_rank = min(100, max(0, iv_rank))
-
-                        if iv_rank >= 80:
-                            iv_pct_label = f"~{iv_rank:.0f}% 🔴 Very High"
-                        elif iv_rank >= 60:
-                            iv_pct_label = f"~{iv_rank:.0f}% 🟠 High"
-                        elif iv_rank >= 40:
-                            iv_pct_label = f"~{iv_rank:.0f}% 🟡 Moderate"
-                        elif iv_rank >= 20:
-                            iv_pct_label = f"~{iv_rank:.0f}% 🟢 Low"
-                        else:
-                            iv_pct_label = f"~{iv_rank:.0f}% 🟢 Very Low"
+                        if iv_rank >= 80:   iv_pct_label = f"~{iv_rank:.0f}% 🔴 Very High"
+                        elif iv_rank >= 60: iv_pct_label = f"~{iv_rank:.0f}% 🟠 High"
+                        elif iv_rank >= 40: iv_pct_label = f"~{iv_rank:.0f}% 🟡 Moderate"
+                        elif iv_rank >= 20: iv_pct_label = f"~{iv_rank:.0f}% 🟢 Low"
+                        else:               iv_pct_label = f"~{iv_rank:.0f}% 🟢 Very Low"
         except Exception:
             pass
 
-        # Keep proxy as fallback if true rank fails
+        # Fallback proxy if IV rank failed
         iv_rank_proxy = iv_rank
         if iv_rank_proxy is None and iv and hv30:
-            iv_rank_proxy = round(iv / hv30 * 50, 0)
-            iv_rank_proxy = min(100, max(0, iv_rank_proxy))
+            iv_rank_proxy = min(100, max(0, round(iv / hv30 * 50, 0)))
             iv_pct_label  = f"~{iv_rank_proxy:.0f}% (proxy)"
 
-        # Earnings date (3 methods)
-        earnings = None
+        # ── Step 4: Earnings date via Ticker.calendar ─────────
+        # .calendar uses a less rate-limited endpoint than .info
+        earnings      = None
+        earnings_days = None
         try:
-            ts = info.get("earningsTimestampNext") or info.get("earningsTimestamp")
-            if ts:
-                dt = pd.Timestamp(ts, unit="s")
-                if dt > pd.Timestamp.now():
-                    earnings = dt.date()
-        except Exception:
-            pass
-
-        if not earnings:
-            try:
-                cal = t.calendar
-                if cal and "Earnings Date" in cal:
+            t_obj2 = yf.Ticker(ticker, session=_yf_session)
+            cal    = t_obj2.calendar
+            if cal is not None and not (hasattr(cal, "empty") and cal.empty):
+                if isinstance(cal, dict) and "Earnings Date" in cal:
                     for d in cal["Earnings Date"]:
                         ts = pd.Timestamp(d)
-                        if ts.tzinfo:
+                        if hasattr(ts, "tzinfo") and ts.tzinfo:
                             ts = ts.tz_localize(None)
                         if ts > pd.Timestamp.now():
                             earnings = ts.date()
                             break
-            except Exception:
-                pass
+                elif isinstance(cal, pd.DataFrame) and "Earnings Date" in cal.columns:
+                    for val in cal["Earnings Date"]:
+                        try:
+                            ts = pd.Timestamp(val)
+                            if hasattr(ts, "tzinfo") and ts.tzinfo:
+                                ts = ts.tz_localize(None)
+                            if ts > pd.Timestamp.now():
+                                earnings = ts.date()
+                                break
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
-        earnings_days = None
         if earnings:
             earnings_days = (pd.Timestamp(str(earnings)) - pd.Timestamp.now()).days
 
-        # Average daily volume
-        avg_vol = safe_float(info.get("averageVolume"))
-
-        # RSI (14-day) — is price momentum stretched?
-        rsi = None
-        try:
-            if len(hist) >= 15:
-                delta = hist["Close"].diff()
-                gain  = delta.clip(lower=0).rolling(14).mean()
-                loss  = (-delta.clip(upper=0)).rolling(14).mean()
-                rs    = gain / loss
-                rsi   = round(float(100 - (100 / (1 + rs)).iloc[-1]), 1)
-        except Exception:
-            pass
-
-        # % above 50-day MA — is price stretched from average?
-        pct_above_ma50 = None
-        try:
-            ma50 = hist["Close"].rolling(50).mean().iloc[-1]
-            pct_above_ma50 = round((price - float(ma50)) / float(ma50) * 100, 1)
-        except Exception:
-            pass
-
-        # ATR (14-day) — average daily range, used for range-bound detection
-        atr = None
-        try:
-            if len(hist) >= 15:
-                high = hist["High"]
-                low  = hist["Low"]
-                close_prev = hist["Close"].shift(1)
-                tr = pd.concat([
-                    high - low,
-                    (high - close_prev).abs(),
-                    (low  - close_prev).abs()
-                ], axis=1).max(axis=1)
-                atr = round(float(tr.rolling(14).mean().iloc[-1]), 2)
-        except Exception:
-            pass
-
-        # Range-bound check: is ATR contracting vs recent average?
-        is_range_bound = False
-        try:
-            if atr and len(hist) >= 30:
-                atr_30 = float(tr.rolling(30).mean().iloc[-1])
-                is_range_bound = atr < atr_30 * 0.85  # ATR 15% below 30-day avg
-        except Exception:
-            pass
-
-        if not price:
-            return None   # don't cache — let the next call retry
+        # Stock name / sector / market from universe dicts
+        name   = (STOCK_UNIVERSE.get(ticker)    or SMALL_CAP_UNIVERSE.get(ticker) or (ticker,"",""))[0]
+        sector = (STOCK_UNIVERSE.get(ticker)    or SMALL_CAP_UNIVERSE.get(ticker) or ("","",""))[1]
+        market = (STOCK_UNIVERSE.get(ticker)    or SMALL_CAP_UNIVERSE.get(ticker) or ("","","",""))[2] if len(STOCK_UNIVERSE.get(ticker, SMALL_CAP_UNIVERSE.get(ticker, ("","","")))) > 2 else ""
 
         return {
             "ticker":          ticker,
-            "name":            STOCK_UNIVERSE.get(ticker, (ticker, "", ""))[0],
-            "sector":          STOCK_UNIVERSE.get(ticker, ("", "", ""))[1],
-            "market":          STOCK_UNIVERSE.get(ticker, ("", "", ""))[2],
+            "name":            name,
+            "sector":          sector,
+            "market":          market,
             "price":           price,
             "range_pct":       range_pct,
             "hv30":            hv30,
@@ -680,7 +677,7 @@ def fetch_stock_data(ticker):
             "options_vol":     options_vol,
             "earnings":        str(earnings) if earnings else None,
             "earnings_days":   earnings_days,
-            "avg_vol":         avg_vol,
+            "avg_vol":         None,
             "rsi":             rsi,
             "pct_above_ma50":  pct_above_ma50,
             "atr":             atr,
@@ -688,307 +685,6 @@ def fetch_stock_data(ticker):
         }
     except Exception:
         return None
-
-
-def generate_income_idea(d, regime_bias, vix_val=None):
-    """
-    Given stock data dict, generate an income (sell premium) trade idea.
-    Returns dict with trade details or None if stock not suitable.
-
-    Income plays work best when:
-    - IV is high (you collect more premium)
-    - Stock is range-bound or mildly trending
-    - No earnings within 30 days (earnings cause IV spikes
-      which would hurt short premium positions)
-    - Options are liquid (tight spreads on IBKR)
-    """
-    if not d or not d["iv"] or not d["hv30"] or not d["price"]:
-        return None
-
-    iv_rank = d["iv_rank_proxy"] or 0
-    iv      = d["iv"]
-    price   = d["price"]
-    hv30    = d["hv30"]
-
-    # Income criteria:
-    # IV rank > 50 means options are expensive relative to
-    # actual moves — good time to sell premium
-    if iv_rank < 45:
-        return None
-
-    # Avoid earnings within 30 days:
-    # When earnings approach, IV spikes dramatically.
-    # If you're short premium, this spike works against you.
-    if d["earnings_days"] and d["earnings_days"] < 30:
-        return None
-
-    # Need liquid options
-    if d["options_vol"] and d["options_vol"] < 500:
-        return None
-
-    # ── Dynamic spread width based on stock price ──────────────
-    # A $5 spread on a $50 stock (10% wide) is very different from
-    # a $5 spread on NVDA at $900 (0.5% wide — almost meaningless).
-    # Scale the spread width so it represents a consistent ~3-4% of price.
-    if price < 50:
-        spread_width = 2.50
-        sell_pct     = 0.94    # 6% OTM on cheap stocks
-    elif price < 150:
-        spread_width = 5.0
-        sell_pct     = 0.93    # 7% OTM
-    elif price < 500:
-        spread_width = 10.0
-        sell_pct     = 0.92    # 8% OTM — more room needed on mid-price stocks
-    else:
-        spread_width = 25.0
-        sell_pct     = 0.91    # 9% OTM on high-price stocks like NVDA
-
-    # ── Anchor sell strike to 50MA or recent low if available ───
-    # Selling puts BELOW a known support level is safer than mechanical OTM %.
-    # The stock has to break that support level before you lose money.
-    ma50_level = None
-    recent_low = None
-    try:
-        _hist_s = yf.Ticker(ticker).history(period="3mo", auto_adjust=True)
-        if len(_hist_s) >= 50:
-            ma50_level = float(_hist_s["Close"].rolling(50).mean().iloc[-1])
-        if len(_hist_s) >= 20:
-            recent_low = float(_hist_s["Low"].tail(20).min())
-    except Exception:
-        pass
-
-    # Choose the best anchor for the sell strike:
-    # Prefer the level that is below price but above the mechanical OTM strike
-    mech_sell = round(price * sell_pct, 0)
-    sell_put  = mech_sell
-
-    if ma50_level and ma50_level < price * 0.98 and ma50_level > price * 0.85:
-        # 50MA is a natural support — sell just below it
-        sell_put = round(ma50_level * 0.99, 0)
-    elif recent_low and recent_low < price * 0.97 and recent_low > price * 0.84:
-        sell_put = round(recent_low * 0.985, 0)
-
-    buy_put = sell_put - spread_width
-
-    # Estimated premium scaled to spread width and IV rank
-    est_premium_per_share = round(spread_width * 0.30 * (iv_rank / 100), 2)
-    est_premium_per_share = max(est_premium_per_share, spread_width * 0.15)
-    est_premium_contract  = round(est_premium_per_share * 100, 0)
-    max_risk_contract     = (spread_width - est_premium_per_share) * 100
-    max_risk_contract     = max(max_risk_contract, spread_width * 70)
-
-    # How many contracts for £700 max risk
-    max_risk_gbp = 700
-    max_risk_usd = max_risk_gbp * GBPUSD
-    contracts    = max(1, int(max_risk_usd / max_risk_contract))
-
-    # ── Income scoring — higher = better candidate ──────────────
-    # Weights explained:
-    #   IV rank (40pts): the higher options are priced vs history,
-    #     the more premium you collect. This is the primary signal.
-    #   Earnings (20pts): short premium = short vega. Earnings cause
-    #     IV to spike, which hurts your position. Avoid within 30 days.
-    #   Liquidity (20pts): wide bid/ask spreads eat your collected premium.
-    #     Need >1000 daily options volume for reasonable fills on IBKR.
-    #   Range-bound (15pts): selling puts into a strong downtrend is
-    #     dangerous. Stocks near mid-range or contracting ATR are safer.
-    #   RSI moderate (10pts): avoid selling puts on overbought stocks
-    #     (RSI>75) — pullback risk is high.
-    score = 0
-    score += min(40, iv_rank * 0.4)
-    if d["earnings_days"] and d["earnings_days"] > 45:
-        score += 20
-    elif d.get("earnings_days") and d["earnings_days"] > 30:
-        score += 10
-    if d["options_vol"] and d["options_vol"] > 5000:
-        score += 20
-    elif d["options_vol"] and d["options_vol"] > 1000:
-        score += 10
-    if d.get("is_range_bound"):
-        score += 15                              # ATR contracting = consolidating
-    elif d.get("range_pct") and 30 < d["range_pct"] < 70:
-        score += 8                               # mid 52W range also a good sign
-    rsi = d.get("rsi")
-    if rsi and 40 < rsi < 65:
-        score += 10                              # RSI not stretched
-    elif rsi and (rsi > 75 or rsi < 30):
-        score -= 10                              # overbought/oversold = risky
-
-    # ── Dynamic expiry recommendation based on VIX ─────────────
-    # VIX spike → shorter expiry collects same premium with less risk
-    # Low VIX → longer expiry needed to collect meaningful premium
-    if vix_val and vix_val >= 30:
-        rec_expiry = "14-21 DTE"
-        expiry_note = f"VIX {vix_val:.0f} — elevated. Shorter expiry (14-21 DTE) collects same premium with less time exposure."
-    elif vix_val and vix_val <= 15:
-        rec_expiry = "45 DTE"
-        expiry_note = f"VIX {vix_val:.0f} — low. Use longer expiry (45 DTE) to collect meaningful premium."
-    else:
-        rec_expiry = "21-30 DTE"
-        expiry_note = f"VIX {vix_val:.0f} — normal. Standard 21-30 DTE expiry."
-
-    return {
-        "type":                "income",
-        "ticker":              d["ticker"],
-        "name":                d["name"],
-        "sector":              d["sector"],
-        "market":              d["market"],
-        "price":               price,
-        "iv":                  iv,
-        "iv_rank_proxy":       iv_rank,
-        "iv_pct_label":        d.get("iv_pct_label", f"~{iv_rank:.0f}%"),
-        "hv30":                hv30,
-        "rsi":                 d.get("rsi"),
-        "pct_above_ma50":      d.get("pct_above_ma50"),
-        "is_range_bound":      d.get("is_range_bound"),
-        "range_pct":           d["range_pct"],
-        "mom_1m":              d["mom_1m"],
-        "earnings":            d["earnings"],
-        "earnings_days":       d["earnings_days"],
-        "options_vol":         d["options_vol"],
-        "sell_put":            sell_put,
-        "buy_put":             buy_put,
-        "est_premium":         est_premium_contract,
-        "max_risk_contract":   max_risk_contract,
-        "contracts":           contracts,
-        "score":               round(score, 0),
-        "strategy":            f"Sell ${sell_put:.0f}/${buy_put:.0f} Put Spread",
-        "spread_width":        spread_width,
-        "rec_expiry":          rec_expiry,
-        "expiry_note":         expiry_note,
-        "anchor_used":         "50MA" if (ma50_level and sell_put != mech_sell and ma50_level < price) else ("Recent Low" if (recent_low and sell_put != mech_sell) else "Mechanical OTM"),
-    }
-
-
-def generate_growth_idea(d, regime_bias, sector_strong=True, vix_val=None):
-    """
-    Given stock data dict, generate a growth (buy options) trade idea.
-    Returns dict with trade details or None if stock not suitable.
-
-    Growth plays work best when:
-    - Stock has clear directional momentum
-    - IV is low (options are cheap — you're buying)
-    - Sector is in a strong trend (tailwind behind the trade)
-    - No earnings within 14 days (unless intentionally trading earnings)
-    """
-    if not d or not d["iv"] or not d["hv30"] or not d["price"]:
-        return None
-
-    iv_rank = d["iv_rank_proxy"] or 0
-    iv      = d["iv"]
-    price   = d["price"]
-    mom_1m  = d["mom_1m"] or 0
-    rng     = d["range_pct"] or 50
-
-    # For calls: need positive momentum + near annual high
-    # For puts: need negative momentum + near annual low
-    is_call = mom_1m >= 3 and rng >= 55
-    is_put  = mom_1m <= -3 and rng <= 45
-
-    if not is_call and not is_put:
-        return None
-
-    # IV rank < 55: options not too expensive to buy
-    if iv_rank > 60:
-        return None
-
-    # Avoid earnings within 14 days
-    # (unless you specifically want an earnings play —
-    # that's a different strategy not covered here)
-    if d["earnings_days"] and d["earnings_days"] < 14:
-        return None
-
-    # Need some options liquidity
-    if d["options_vol"] and d["options_vol"] < 200:
-        return None
-
-    direction = "Call" if is_call else "Put"
-
-    # Suggest slightly OTM strike (best risk/reward for directional plays)
-    if direction == "Call":
-        strike = round(price * 1.03, 0)   # 3% OTM call
-    else:
-        strike = round(price * 0.97, 0)   # 3% OTM put
-
-    # Rough premium estimate (OTM option, ~14-21 DTE)
-    # Using Black-Scholes approximation: premium ≈ 0.4 × IV × price × √(T/252)
-    T = 21 / 252
-    est_premium_per_share = round(0.4 * (iv / 100) * price * np.sqrt(T), 2)
-    est_premium_per_share = max(est_premium_per_share, 0.50)
-    est_cost_contract     = round(est_premium_per_share * 100, 0)
-
-    # How many contracts for £700 budget
-    budget_gbp   = 700
-    budget_usd   = budget_gbp * GBPUSD
-    contracts    = max(1, int(budget_usd / est_cost_contract))
-    # Cap at 5 — diversification
-    contracts    = min(contracts, 5)
-
-    # ── Growth scoring — higher = better candidate ──────────────
-    # Weights explained:
-    #   Momentum (30pts): is there already a move in the right direction?
-    #     Buying calls on a stock already moving up = momentum confirmation.
-    #   52W position (25pts): calls need the stock near its high (strong trend).
-    #     Puts need the stock near its low (established downtrend).
-    #   IV cheapness (20pts): the less you pay for options relative to
-    #     historical volatility, the better your risk/reward.
-    #   RSI (15pts): for calls, RSI 50-70 is ideal — not overbought yet.
-    #     For puts, RSI 30-50 is ideal — not oversold yet.
-    #   Liquidity + sector (15pts): ensures the trade is executable.
-    score = 0
-    score += min(30, abs(mom_1m) * 2)
-    score += min(25, (rng - 50) * 1.2) if is_call else min(25, (50 - rng) * 1.2)
-    score += max(0, (55 - iv_rank) * 0.4)
-    rsi = d.get("rsi")
-    if rsi:
-        if is_call and 50 <= rsi <= 70:
-            score += 15                          # ideal call RSI — trending not overbought
-        elif is_call and rsi > 75:
-            score -= 15                          # overbought — pullback risk for calls
-        elif not is_call and 30 <= rsi <= 50:
-            score += 15                          # ideal put RSI — trending down not oversold
-        elif not is_call and rsi < 25:
-            score -= 15                          # oversold — bounce risk for puts
-    pct_ma = d.get("pct_above_ma50")
-    if pct_ma:
-        if is_call and 0 < pct_ma < 15:
-            score += 10                          # above MA but not too stretched
-        elif is_call and pct_ma >= 15:
-            score -= 5                           # too far above MA — stretched
-        elif not is_call and -15 < pct_ma < 0:
-            score += 10                          # below MA but not too oversold
-    if d["options_vol"] and d["options_vol"] > 2000:
-        score += 10
-    if sector_strong:
-        score += 10
-
-    return {
-        "type":            "growth",
-        "direction":       direction,
-        "ticker":          d["ticker"],
-        "name":            d["name"],
-        "sector":          d["sector"],
-        "market":          d["market"],
-        "price":           price,
-        "iv":              iv,
-        "iv_rank_proxy":   iv_rank,
-        "iv_pct_label":    d.get("iv_pct_label", f"~{iv_rank:.0f}%"),
-        "hv30":            d["hv30"],
-        "rsi":             d.get("rsi"),
-        "pct_above_ma50":  d.get("pct_above_ma50"),
-        "range_pct":       rng,
-        "mom_1m":          mom_1m,
-        "earnings":        d["earnings"],
-        "earnings_days":   d["earnings_days"],
-        "options_vol":     d["options_vol"],
-        "strike":          strike,
-        "direction":       direction,
-        "est_cost":        est_cost_contract,
-        "contracts":       contracts,
-        "score":           round(score, 0),
-        "strategy":        f"Buy ${strike:.0f} {direction} (21 DTE)",
-    }
-
 
 
 @st.cache_data(ttl=3600)   # 1-hour cache — fundamentals don't change hourly
@@ -1065,7 +761,7 @@ def fetch_fundamentals(ticker):
         # IWM relative strength (1 month)
         rs_vs_iwm = None
         try:
-            iwm_hist = yf.download("IWM", period="1mo", auto_adjust=True, progress=False)
+            iwm_hist = yf.download("IWM", period="1mo", auto_adjust=True, progress=False, session=_yf_session)
             iwm_ret  = round((float(iwm_hist["Close"].iloc[-1]) / float(iwm_hist["Close"].iloc[0]) - 1) * 100, 1)
             if mom_1m is not None:
                 rs_vs_iwm = round(mom_1m - iwm_ret, 1)
@@ -1246,7 +942,8 @@ def fetch_all_etf_returns(tickers):
     try:
         # Daily for 3D/1W/1M/3M
         raw = yf.download(all_t, period="6mo", interval="1d",
-                          auto_adjust=True, progress=False)
+                          auto_adjust=True, progress=False,
+                          session=_yf_session)
         if isinstance(raw.columns, pd.MultiIndex):
             closes = raw["Close"]
         else:
@@ -1256,7 +953,8 @@ def fetch_all_etf_returns(tickers):
 
         # Intraday for 1D (today vs yesterday's close)
         intra = yf.download(all_t, period="5d", interval="5m",
-                            auto_adjust=True, progress=False)
+                            auto_adjust=True, progress=False,
+                            session=_yf_session)
         if isinstance(intra.columns, pd.MultiIndex):
             intra_c = intra["Close"]
         else:
@@ -1358,7 +1056,8 @@ def calc_relative_strength(stock_tickers, etf_ticker, period="1mo"):
     """Calculate each stock's return vs the ETF."""
     all_t = list(set(stock_tickers + [etf_ticker]))
     try:
-        raw    = yf.download(all_t, period=period, auto_adjust=True, progress=False)
+        raw    = yf.download(all_t, period=period, auto_adjust=True, progress=False,
+                          session=_yf_session)
         closes = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
         rets   = ((closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100).round(2)
         etf_r  = float(rets.get(etf_ticker, 0))
@@ -1486,7 +1185,8 @@ def fetch_vwap(tickers):
     for ticker in tickers:
         try:
             df = yf.download(ticker, period="1d", interval="5m",
-                             auto_adjust=True, progress=False)
+                             auto_adjust=True, progress=False,
+                             session=_yf_session)
             if df.empty:
                 continue
             if isinstance(df.columns, pd.MultiIndex):
@@ -1693,7 +1393,8 @@ def fetch_breadth():
         all_stocks = list(STOCK_UNIVERSE.keys()) + list(SMALL_CAP_UNIVERSE.keys())
         raw = yf.download(
             all_stocks, period="2mo", interval="1d",
-            auto_adjust=True, progress=False
+            auto_adjust=True, progress=False,
+            session=_yf_session,
         )
         if isinstance(raw.columns, pd.MultiIndex):
             closes = raw["Close"]
@@ -2853,10 +2554,14 @@ with tab_macro:
             st.metric("Copper/Gold Ratio", f"{cg:.5f}",
                       help="Rising = growth beating fear. Falling = fear dominating. Best single cross-asset signal.")
     with r3:
-        rb = cross.get("reit_bond_signal")
+        rb = cross.get("reit_bond_signal", "")
         if rb:
-            st.metric("REIT vs Bond Signal", rb[0])
-            st.caption(rb[1])
+            # rb is a full string e.g. "🟢 REITs outperforming..."
+            # Extract just the emoji for the metric, show full text as caption
+            emoji = rb.split()[0] if rb else "🟡"
+            label = rb[len(emoji):].strip() if len(rb) > len(emoji) else rb
+            st.metric("REIT vs Bond Signal", emoji)
+            st.caption(label)
 
     st.divider()
 
@@ -3084,8 +2789,9 @@ If HYG drops more than 1% on a day when SPY is flat or up, reduce your call posi
         """)
 
     with st.expander("Yield Curve — 10Y vs 2Y", expanded=False):
+        _spread_display = f"{y10 - y2:+.2f}%" if (y10 and y2) else "N/A"
         st.markdown(f"""
-**Current spread: {f'{spread:+.2f}%' if y10 and y2 else 'N/A'}**
+**Current spread: {_spread_display}**
 
 The yield curve shows the difference between what you earn lending money for 10 years vs 2 years.
 
@@ -3211,7 +2917,7 @@ with tab_sectors:
                 rng  = None
                 pc_r = None
                 try:
-                    t    = yf.Ticker(ticker)
+                    t    = yf.Ticker(ticker, session=_yf_session)
                     info = t.info
                     p    = safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
                     lo   = safe_float(info.get("fiftyTwoWeekLow"))
@@ -3274,7 +2980,7 @@ with tab_sectors:
 
                     # Fetch conflict data
                     try:
-                        _t    = yf.Ticker(ticker)
+                        _t    = yf.Ticker(ticker, session=_yf_session)
                         _hist = _t.history(period="6mo")
                         _info = _t.info
                         _price = safe_float(_info.get("regularMarketPrice") or _info.get("currentPrice"))
@@ -3462,7 +3168,7 @@ with tab_sectors:
                                 )
                                 if not rs.empty:
                                     h = h.merge(rs[["Ticker","vs ETF %","Status"]], on="Ticker", how="left")
-                                def _hl(row):
+                                def _hl_calls(row):
                                     s = [""] * len(row)
                                     if "Status" in row.index:
                                         i = list(row.index).index("Status")
@@ -3495,7 +3201,7 @@ with tab_sectors:
                                 )
                                 if not rs.empty:
                                     h = h.merge(rs[["Ticker","vs ETF %","Status"]], on="Ticker", how="left")
-                                def _hl2(row):
+                                def _hl_puts(row):
                                     s = [""] * len(row)
                                     if "Status" in row.index:
                                         i = list(row.index).index("Status")
@@ -4446,15 +4152,45 @@ the regime to turn before committing capital.
 
 with tab_journal:
     st.subheader("📒 Trade Journal")
-    st.caption(
-        "Log every trade you take from this dashboard. "
-        "Tracks whether the signals actually worked over time. "
-        "Stored in your browser session — export to CSV to save permanently."
-    )
 
-    # Initialise journal in session state
-    if "journal" not in st.session_state:
-        st.session_state["journal"] = []
+    # ── Load journal — Supabase if configured, else session state ──
+    journal = journal_load()
+    source  = st.session_state.get("journal_source", "")
+
+    if "🟢" in source:
+        st.success(f"✅ **Persistent storage active** — {source}. Trades reload automatically.")
+    elif "🟡" in source:
+        st.warning(
+            "🟡 **Session state only** — trades lost when you close this tab.  \n"
+            "Add `SUPABASE_URL` and `SUPABASE_KEY` to Streamlit Cloud → App Settings → Secrets to persist forever."
+        )
+        with st.expander("📋 Supabase setup (10 minutes, free)", expanded=False):
+            st.markdown("""
+**Step 1** — [supabase.com](https://supabase.com) → New project (free tier)
+
+**Step 2** — SQL Editor → run:
+```sql
+create table journal (
+  id uuid default gen_random_uuid() primary key,
+  date text, ticker text, type text,
+  premium numeric, contracts integer, total_cost_gbp numeric,
+  expiry text, regime text, iv_rank integer, thesis text,
+  exit_price numeric, pnl_gbp numeric,
+  result text default 'Open',
+  created_at timestamp with time zone default now()
+);
+```
+**Step 3** — Settings → API → copy Project URL and anon key
+
+**Step 4** — Streamlit Cloud → App Settings → Secrets:
+```toml
+SUPABASE_URL = "https://yourproject.supabase.co"
+SUPABASE_KEY = "your-anon-key"
+```
+**Step 5** — Redeploy. Done.
+            """)
+
+    st.caption("Log every trade. Tracks which signals actually worked over time.")
 
     # ── Log a new trade ───────────────────────────────────────
     st.markdown("### ➕ Log a Trade")
@@ -4467,6 +4203,7 @@ with tab_journal:
                 "Growth — Buy Call",
                 "Growth — Buy Put",
                 "Income — Call Credit Spread",
+                "Short — Buy Put (bearish thesis)",
                 "Other",
             ])
         with jc2:
@@ -4476,39 +4213,36 @@ with tab_journal:
         with jc3:
             j_regime    = st.selectbox("Regime at entry", [
                 regime_label,
-                "🟢 Risk-On",
-                "🟡 Mildly Risk-On",
-                "🟡 Neutral",
-                "🟠 Cautious",
-                "🔴 Risk-Off",
-                "⚠️ Stagflation Risk",
+                "🟢 Risk-On", "🟡 Mildly Risk-On", "🟡 Neutral",
+                "🟠 Cautious", "🔴 Risk-Off", "⚠️ Stagflation Risk",
             ])
-            j_iv_rank   = st.number_input("IV Rank at entry (~%)", min_value=0, max_value=100, step=1)
-            j_thesis    = st.text_area("Thesis / why this trade", height=80,
-                                       placeholder="e.g. SMH breaking out, NVDA leading semis, IV rank 75%")
+            j_iv_rank = st.number_input("IV Rank at entry (~%)", min_value=0, max_value=100, step=1)
+            j_thesis  = st.text_area("Thesis / why this trade", height=80,
+                placeholder="e.g. NVDA leading SMH, IV rank 72%, above VWAP, RSI 58")
 
         j_submitted = st.form_submit_button("📝 Log Trade", type="primary")
         if j_submitted and j_ticker:
             entry_cost_gbp = round(j_entry * j_contracts * 100 / GBPUSD, 0)
-            st.session_state["journal"].append({
-                "Date":          pd.Timestamp.now().strftime("%Y-%m-%d"),
-                "Ticker":        j_ticker,
-                "Type":          j_type,
-                "Premium $":     j_entry,
-                "Contracts":     int(j_contracts),
-                "Total Cost £":  entry_cost_gbp,
-                "Expiry":        str(j_expiry),
-                "Regime":        j_regime,
-                "IV Rank ~":     j_iv_rank,
-                "Thesis":        j_thesis,
-                "Exit Price $":  None,
-                "P&L £":         None,
-                "Result":        "Open",
-            })
-            st.success(f"✅ {j_ticker} {j_type} logged.")
+            new_entry = {
+                "Date":         pd.Timestamp.now().strftime("%Y-%m-%d"),
+                "Ticker":       j_ticker,
+                "Type":         j_type,
+                "Premium $":    j_entry,
+                "Contracts":    int(j_contracts),
+                "Total Cost £": entry_cost_gbp,
+                "Expiry":       str(j_expiry),
+                "Regime":       j_regime,
+                "IV Rank ~":    j_iv_rank,
+                "Thesis":       j_thesis,
+                "Exit Price $": None,
+                "P&L £":        None,
+                "Result":       "Open",
+            }
+            journal_add(new_entry)
+            st.success(f"✅ {j_ticker} {j_type} logged and saved.")
+            st.rerun()
 
-    # ── Update existing trades ────────────────────────────────
-    journal = st.session_state["journal"]
+    # ── Update open trades ────────────────────────────────────
 
     if journal:
         st.divider()
@@ -4539,22 +4273,21 @@ with tab_journal:
                             ["Open", "Win", "Loss", "Break-even", "Expired worthless"],
                             key=f"result_{idx}"
                         )
-                    if st.button("💾 Update", key=f"update_{idx}"):
-                        # P&L calculation
-                        entry = trade["Premium $"]
-                        contracts = trade["Contracts"]
-                        if "Income" in trade["Type"]:
-                            # Sold premium: profit = entry - exit
-                            pnl_per_share = entry - exit_price
+                    if st.button("💾 Save Update", key=f"update_{idx}", type="primary"):
+                        entry_p   = trade.get("Premium $", 0) or 0
+                        contracts = trade.get("Contracts", 1) or 1
+                        if "Income" in trade.get("Type",""):
+                            pnl_per_share = entry_p - exit_price
                         else:
-                            # Bought options: profit = exit - entry
-                            pnl_per_share = exit_price - entry
+                            pnl_per_share = exit_price - entry_p
                         pnl_usd = round(pnl_per_share * contracts * 100, 2)
                         pnl_gbp = round(pnl_usd / GBPUSD, 0)
-
-                        st.session_state["journal"][idx]["Exit Price $"] = exit_price
-                        st.session_state["journal"][idx]["P&L £"]        = pnl_gbp
-                        st.session_state["journal"][idx]["Result"]        = result
+                        journal_update(
+                            st.session_state["journal"][idx],
+                            exit_price, pnl_gbp, result
+                        )
+                        st.session_state.pop("journal_loaded_from_db", None)
+                        st.success(f"✅ Updated — P&L: £{pnl_gbp:,.0f}")
                         st.rerun()
 
         # ── Full journal table ────────────────────────────────
@@ -4645,25 +4378,21 @@ with tab_journal:
                 fig_pnl.update_layout(height=250)
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
-        # ── Export ────────────────────────────────────────────
         st.divider()
-        csv = jdf.to_csv(index=False)
-        st.download_button(
-            "📥 Export Journal to CSV",
-            data=csv,
-            file_name=f"trade_journal_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-        )
-        st.caption(
-            "⚠️ The journal is stored in your browser session — "
-            "it will be lost when you close the tab. "
-            "Export to CSV regularly to keep a permanent record. "
-            "In a future version this can be connected to Google Sheets for persistence."
-        )
-
-        if st.button("🗑️ Clear All Trades", key="clear_journal"):
-            st.session_state["journal"] = []
-            st.rerun()
+        sc1_j, sc2_j = st.columns(2)
+        with sc1_j:
+            csv = jdf.to_csv(index=False)
+            st.download_button(
+                "📥 Export to CSV",
+                data=csv,
+                file_name=f"trade_journal_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with sc2_j:
+            if st.button("🗑️ Clear All Trades", key="clear_journal", use_container_width=True):
+                journal_delete_all()
+                st.rerun()
 
     else:
         st.info(
